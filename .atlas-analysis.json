@@ -1,0 +1,109 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "shvm-db",
+  "projectDescription": "A DynamoDB-compatible distributed database built on Cloudflare Durable Objects with SQLite storage and deterministic partition routing",
+  "theme": "aspen",
+  "primaryColor": "#1E40AF",
+  "lightColor": "#3B82F6",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["introduction", "motivation", "why-shvm-db"]
+          },
+          {
+            "group": "Getting Started",
+            "pages": ["quickstart", "installation", "deployment"]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/data-model",
+              "architecture/partitioning",
+              "architecture/durable-objects",
+              "architecture/routing",
+              "architecture/consistency"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/performance",
+              "operations/benchmarking",
+              "operations/monitoring",
+              "operations/cost-model",
+              "operations/fault-tolerance"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/table-management",
+              "guides/working-with-items",
+              "guides/caching-strategy",
+              "guides/compatibility-testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Table Operations",
+            "pages": [
+              "api/create-table",
+              "api/delete-table",
+              "api/list-tables",
+              "api/describe-table"
+            ]
+          },
+          {
+            "group": "Item Operations",
+            "pages": [
+              "api/put-item",
+              "api/get-item",
+              "api/update-item",
+              "api/delete-item"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "api/condition-expressions",
+              "api/update-expressions",
+              "api/trace-api"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "DynamoDB API compatibility",
+    "Single-writer partition consistency",
+    "Deterministic hash-based routing",
+    "SQLite per-partition storage",
+    "Edge caching with write-through",
+    "Cloudflare Durable Objects architecture",
+    "YCSB benchmark support",
+    "Observable performance characteristics"
+  ],
+  "publicApiSurface": [
+    "CreateTable",
+    "DeleteTable",
+    "ListTables",
+    "DescribeTable",
+    "PutItem",
+    "GetItem",
+    "UpdateItem",
+    "DeleteItem",
+    "Condition Expressions",
+    "Update Expressions"
+  ]
+}
