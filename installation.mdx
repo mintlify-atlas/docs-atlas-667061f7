@@ -144,6 +144,7 @@ You can configure shvm-db using environment variables in `wrangler.jsonc`:
 |----------|---------|-------------|
 | `SHVM_DEBUG` | `"false"` | Enable debug logging |
 | `NUM_PARTITIONS` | `100` | Number of partition buckets for hash distribution |
+| `REPORT_LOAD_THRESHOLD` | `10` | Number of requests before a PartitionDO reports load metrics |
 
 <Accordion title="Enable Debug Mode">
   To enable debug logging, update `wrangler.jsonc`:
