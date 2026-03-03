@@ -1,0 +1,575 @@
+---
+title: Durable Objects Internals
+description: Deep dive into PartitionDO and TableRegistryDO implementation details
+---
+
+## Overview
+
+shvm-db uses two types of Cloudflare Durable Objects:
+
+1. **PartitionDO**: Data plane - stores and serves item data
+2. **TableRegistryDO**: Control plane - manages table metadata
+
+Each serves a distinct purpose and operates independently.
+
+## PartitionDO Architecture
+
+### Class Structure
+
+```typescript
+// From src/partition-do.ts:21-32
+export class PartitionDO extends DurableObject<Env> {
+    sql: SqlStorage;              // SQLite storage interface
+    loadCounter: number = 0;      // Request counter for load reporting
+    private log: Logger;          // Debug logger
+
+    constructor(ctx: DurableObjectState, env: Env) {
+        super(ctx, env);
+        this.sql = ctx.storage.sql;
+        this.log = createDOLogger(env.SHVM_DEBUG);
+        runPartitionDOMigrations(this.sql);  // Ensure schema exists
+        this.log("PartitionDO", `constructor id=${ctx.id.toString()}`);
+    }
+}
+```
+
+### Lifecycle
+
+1. **Creation**: First request to partition creates DO instance
+2. **Initialization**: Constructor runs schema migrations
+3. **Steady State**: Handles item operations (Get/Put/Update/Delete)
+4. **Hibernation**: DO may hibernate after inactivity
+5. **Wakeup**: Next request wakes DO, SQLite state persists
+
+### SQLite Integration
+
+PartitionDO uses the built-in SQL storage API:
+
+```typescript
+// Access SQLite
+this.sql = ctx.storage.sql;
+
+// Execute query
+const cursor = this.sql.exec(
+  "SELECT value, deleted FROM items_v3 WHERE id = ?",
+  doKey
+);
+
+// Process results
+const row = Array.from(cursor)[0];
+```
+
+**Key Properties:**
+- Transactional (ACID guarantees)
+- WAL mode for better concurrency
+- Automatically persisted by Cloudflare
+- Survives DO hibernation/restart
+
+## Item Operations
+
+### GetItem Implementation
+
+```typescript
+// From src/partition-do.ts:63-77
+private async _getItemLocally(doKey: string, requestId?: string): Promise<any | null> {
+    const tSql = Date.now();
+    const cursor = this.sql.exec(
+        PartitionDOQueries.Items.GET_LATEST, 
+        doKey
+    );
+    const row = Array.from(cursor)[0] as any;
+    this.recordTrace(requestId, "partition_sql_read", 0, Date.now() - tSql);
+
+    let result: any = null;
+    if (!row || (row.deleted as number) === 1) {
+        result = null;  // Item doesn't exist or was deleted
+    } else {
+        result = JSON.parse(row.value as string);
+    }
+
+    return result;
+}
+```
+
+**Flow:**
+1. Execute SQL query with item key
+2. Check if row exists and not deleted
+3. Parse JSON value if found
+4. Record timing metrics
+5. Return item or null
+
+### PutItem Implementation
+
+```typescript
+// From src/partition-do.ts:89-111
+async handlePutItem(
+    doKey: string, 
+    value: unknown, 
+    partitionId: number, 
+    tableName: string, 
+    requestId?: string, 
+    conditionExpression?: string, 
+    expressionAttributeNames?: Record<string, string>, 
+    expressionAttributeValues?: Record<string, any>, 
+    returnValues?: string, 
+    invokeTs?: number
+): Promise<any> {
+    const t0 = Date.now();
+    if (invokeTs) this.recordTrace(requestId, "partition_queue", 0, t0 - invokeTs);
+
+    // Evaluate condition expression if provided
+    if (conditionExpression) {
+        const currentItem = await this._getItemLocally(doKey, requestId);
+        try {
+            const pass = evaluateCondition(
+                currentItem, 
+                conditionExpression, 
+                expressionAttributeNames, 
+                expressionAttributeValues
+            );
+            if (!pass) throw new Error("The conditional request failed");
+        } catch (e: any) {
+            const err = new Error(e.message);
+            err.name = e.name === "ValidationError" 
+                ? "ValidationException" 
+                : "ConditionalCheckFailedException";
+            throw err;
+        }
+    }
+
+    // Write to SQLite
+    const tSql = Date.now();
+    this.sql.exec(
+        PartitionDOQueries.Items.INSERT, 
+        doKey,                    // id
+        1,                        // version
+        JSON.stringify(value),    // value
+        0                         // deleted (0 = active)
+    );
+    this.recordTrace(requestId, "partition_sql_write", 0, Date.now() - tSql);
+
+    this.recordTrace(requestId, "partition_put_item", 0, Date.now() - t0);
+    return {};
+}
+```
+
+**Flow:**
+1. Record queue timing (time waiting to execute)
+2. If conditional: Read current item and evaluate condition
+3. Write item to SQLite (INSERT OR REPLACE)
+4. Record timing metrics
+5. Return empty object (success)
+
+### UpdateItem Implementation
+
+```typescript
+// From src/partition-do.ts:142-177
+async handleUpdateItem(
+    doKey: string, 
+    updates: Record<string, AttributeValueUpdate>, 
+    partitionId: number, 
+    tableName: string, 
+    requestId?: string, 
+    updateExpression?: string, 
+    conditionExpression?: string, 
+    expressionAttributeNames?: Record<string, string>, 
+    expressionAttributeValues?: Record<string, any>, 
+    returnValues?: string, 
+    invokeTs?: number
+): Promise<any> {
+    const t0 = Date.now();
+    if (invokeTs) this.recordTrace(requestId, "partition_queue", 0, t0 - invokeTs);
+
+    // Read current item (or empty object)
+    let currentItem: Record<string, any> = 
+        (await this._getItemLocally(doKey, requestId)) || {};
+
+    // Evaluate condition expression
+    if (conditionExpression) {
+        try {
+            const pass = evaluateCondition(
+                Object.keys(currentItem).length > 0 ? currentItem : null,
+                conditionExpression, 
+                expressionAttributeNames, 
+                expressionAttributeValues
+            );
+            if (!pass) throw new Error("The conditional request failed");
+        } catch (e: any) {
+            const err = new Error(e.message);
+            err.name = e.name === "ValidationError" 
+                ? "ValidationException" 
+                : "ConditionalCheckFailedException";
+            throw err;
+        }
+    }
+
+    // Apply updates
+    if (updateExpression) {
+        // Modern UpdateExpression syntax
+        evaluateUpdateExpression(
+            currentItem, 
+            updateExpression, 
+            expressionAttributeNames, 
+            expressionAttributeValues
+        );
+    } else {
+        // Legacy AttributeUpdates syntax
+        for (const [key, update] of Object.entries(updates)) {
+            const action = update.Action || 'PUT';
+            if (action === 'PUT') currentItem[key] = update.Value;
+            else if (action === 'DELETE') delete currentItem[key];
+        }
+    }
+
+    // Write updated item to SQLite
+    const tSql = Date.now();
+    this.sql.exec(
+        PartitionDOQueries.Items.INSERT, 
+        doKey, 
+        1, 
+        JSON.stringify(currentItem), 
+        0
+    );
+    this.recordTrace(requestId, "partition_sql_write", 0, Date.now() - tSql);
+
+    this.recordTrace(requestId, "partition_update_item", 0, Date.now() - t0);
+
+    if (returnValues === "ALL_NEW") return { Attributes: currentItem };
+    return {};
+}
+```
+
+**Flow:**
+1. Read current item from SQLite
+2. Evaluate condition expression (if provided)
+3. Apply updates (UpdateExpression or AttributeUpdates)
+4. Write updated item to SQLite
+5. Return updated item if requested
+
+### DeleteItem Implementation
+
+```typescript
+// From src/partition-do.ts:113-140
+async handleDeleteItem(
+    doKey: string, 
+    partitionId: number, 
+    tableName: string, 
+    requestId?: string, 
+    conditionExpression?: string, 
+    expressionAttributeNames?: Record<string, string>, 
+    expressionAttributeValues?: Record<string, any>, 
+    returnValues?: string, 
+    invokeTs?: number
+): Promise<any> {
+    const t0 = Date.now();
+    if (invokeTs) this.recordTrace(requestId, "partition_queue", 0, t0 - invokeTs);
+
+    let currentItem: any = null;
+    if (conditionExpression || returnValues === "ALL_OLD") {
+        currentItem = await this._getItemLocally(doKey, requestId);
+    }
+
+    if (conditionExpression) {
+        try {
+            const pass = evaluateCondition(
+                currentItem, 
+                conditionExpression, 
+                expressionAttributeNames, 
+                expressionAttributeValues
+            );
+            if (!pass) throw new Error("The conditional request failed");
+        } catch (e: any) {
+            const err = new Error(e.message);
+            err.name = e.name === "ValidationError" 
+                ? "ValidationException" 
+                : "ConditionalCheckFailedException";
+            throw err;
+        }
+    }
+
+    // Write tombstone (deleted=1, value=null)
+    const tSql = Date.now();
+    this.sql.exec(
+        PartitionDOQueries.Items.INSERT, 
+        doKey, 
+        1, 
+        null,   // value = null
+        1       // deleted = 1
+    );
+    this.recordTrace(requestId, "partition_sql_write", 0, Date.now() - tSql);
+
+    this.recordTrace(requestId, "partition_delete_item", 0, Date.now() - t0);
+    if (returnValues === "ALL_OLD" && currentItem) return { Attributes: currentItem };
+    return {};
+}
+```
+
+**Flow:**
+1. Read current item (if condition or returnValues)
+2. Evaluate condition expression (if provided)
+3. Write tombstone to SQLite (deleted=1)
+4. Return old item if requested
+
+## TableRegistryDO Architecture
+
+### Class Structure
+
+```typescript
+// From src/table-registry-do.ts:5
+export class TableRegistryDO extends DurableObject {
+    // Uses ctx.storage (key-value), not SQL
+}
+```
+
+**Key Difference:** TableRegistryDO uses Durable Object key-value storage, not SQLite.
+
+### CreateTable Implementation
+
+```typescript
+// From src/table-registry-do.ts:6-45
+async createTable(input: CreateTableInput): Promise<TableDescription> {
+    // Validate key schema
+    if (!input.KeySchema || input.KeySchema.length === 0) {
+        throw new ValidationError(
+            "No defined key schema. A key schema containing at least " +
+            "a hash key must be defined for all tables"
+        );
+    }
+
+    // Check if table already exists
+    const existing = await this.ctx.storage.get<TableMetadata>(input.TableName);
+    if (existing) {
+        throw new Error(`Table ${input.TableName} already exists`);
+    }
+
+    // Build metadata object
+    const metadata: any = {
+        TableName: input.TableName,
+        KeySchema: input.KeySchema || [],
+        AttributeDefinitions: input.AttributeDefinitions || [],
+        TableStatus: "ACTIVE",  // Instant creation (no async provisioning)
+        CreationDateTime: Date.now() / 1000,
+        ItemCount: 0,
+        TableSizeBytes: 0,
+        TableArn: `arn:aws:dynamodb:ddblocal:000000000000:table/${input.TableName}`,
+        DeletionProtectionEnabled: false,
+        ProvisionedThroughput: input.ProvisionedThroughput || {
+            LastDecreaseDateTime: 0,
+            LastIncreaseDateTime: 0,
+            NumberOfDecreasesToday: 0,
+            ReadCapacityUnits: 0,
+            WriteCapacityUnits: 0
+        }
+    };
+
+    if (input.BillingMode === "PAY_PER_REQUEST") {
+        metadata.BillingModeSummary = {
+            BillingMode: "PAY_PER_REQUEST",
+            LastUpdateToPayPerRequestDateTime: Date.now() / 1000
+        };
+    }
+
+    // Store metadata
+    await this.ctx.storage.put(input.TableName, metadata);
+
+    return { TableDescription: metadata };
+}
+```
+
+**Key Points:**
+- Synchronous validation
+- Instant table creation (no background provisioning)
+- Stored in key-value storage (not SQLite)
+- Returns immediately with ACTIVE status
+
+### GetTable Implementation
+
+```typescript
+// From src/table-registry-do.ts:64-67
+async getTable(tableName: string): Promise<TableMetadata | null> {
+    const metadata = await this.ctx.storage.get<TableMetadata>(tableName);
+    return metadata || null;
+}
+```
+
+### ListTables Implementation
+
+```typescript
+// From src/table-registry-do.ts:69-93
+async listTables(
+    limit?: number, 
+    startKey?: string
+): Promise<{ TableNames: string[]; LastEvaluatedTableName?: string }> {
+    // Get all tables from storage
+    const tables = await this.ctx.storage.list<TableMetadata>();
+    let tableNames = Array.from(tables.keys()).sort();
+
+    // Apply pagination (ExclusiveStartTableName)
+    if (startKey) {
+        const startIdx = tableNames.indexOf(startKey);
+        if (startIdx >= 0) {
+            tableNames = tableNames.slice(startIdx + 1);
+        }
+    }
+
+    // Apply limit (default 100)
+    const applyLimit = limit || 100;
+    const resultNames = tableNames.slice(0, applyLimit);
+
+    const result: { TableNames: string[]; LastEvaluatedTableName?: string } = {
+        TableNames: resultNames
+    };
+
+    // Include pagination token if more results exist
+    if (tableNames.length > applyLimit) {
+        result.LastEvaluatedTableName = resultNames[resultNames.length - 1];
+    }
+
+    return result;
+}
+```
+
+## Single-Writer Guarantee
+
+### How It Works
+
+Cloudflare Durable Objects provide single-writer guarantee:
+
+1. **Deterministic Routing**: Same partition key → same DO instance
+2. **Single-Threaded**: Each DO runs on single JavaScript isolate
+3. **Serialized Execution**: Requests queued and processed sequentially
+4. **No Concurrent Writes**: Impossible to have race conditions within partition
+
+### Example: Race Condition Prevention
+
+```typescript
+// Two concurrent requests to same partition
+Request A: UpdateItem { counter: +1 }
+Request B: UpdateItem { counter: +1 }
+
+// Traditional database (without locking)
+A reads counter=10
+B reads counter=10  ← Race condition!
+A writes counter=11
+B writes counter=11  ← Lost update!
+
+// Durable Object (single-writer)
+A reads counter=10
+A writes counter=11
+  ↓ (B waits in queue)
+B reads counter=11  ← Sees A's write
+B writes counter=12  ← Correct!
+```
+
+### Queue Timing
+
+PartitionDO tracks time spent waiting in queue:
+
+```typescript
+// From src/partition-do.ts:91
+if (invokeTs) this.recordTrace(requestId, "partition_queue", 0, t0 - invokeTs);
+```
+
+**Typical queue times:**
+- Low load: < 1ms
+- Moderate load: 1-5ms
+- High load: 5-20ms
+- Overloaded: > 20ms (warning sign)
+
+## Performance Characteristics
+
+### Per-Operation Latency
+
+| Operation | Typical Latency | Notes |
+|-----------|----------------|-------|
+| GetItem | 2-8 ms | Single SQLite SELECT |
+| PutItem | 3-10 ms | Single SQLite INSERT |
+| UpdateItem | 5-15 ms | Read + modify + write |
+| DeleteItem | 3-10 ms | Write tombstone |
+| Conditional Put | 5-15 ms | Read + evaluate + write |
+
+### Throughput Limits
+
+**Per Partition:**
+- Writes: 500-2,000 ops/sec
+- Reads: 2,000-10,000 ops/sec
+
+**Bottlenecks:**
+1. Single-threaded JavaScript execution
+2. SQLite write serialization
+3. JSON parse/stringify overhead
+
+### Memory Usage
+
+Each PartitionDO uses:
+- **Base**: ~2 MB (V8 isolate overhead)
+- **SQLite**: Proportional to database size
+- **Active queries**: ~1 KB per concurrent request
+
+## Tracing and Observability
+
+### Trace Events
+
+PartitionDO records detailed timing information:
+
+```typescript
+// From src/partition-do.ts:41-46
+private recordTrace(
+    requestId: string | undefined, 
+    step: string, 
+    startMs: number, 
+    durationMs: number, 
+    attributes?: Record<string, string | number | boolean>
+) {
+    if (!requestId || !this.env.TRACE_DO) return;
+    const event: TraceEvent = { 
+        requestId, 
+        step, 
+        startMs, 
+        durationMs, 
+        attributes 
+    };
+    const stub = this.env.TRACE_DO.get(
+        this.env.TRACE_DO.idFromName(TRACE_DO_SINGLETON_NAME)
+    );
+    this.ctx.waitUntil(stub.recordEvent(event));
+}
+```
+
+**Traced Operations:**
+- `partition_queue`: Time waiting in queue
+- `partition_sql_read`: SQLite SELECT duration
+- `partition_sql_write`: SQLite INSERT duration
+- `partition_get_item`: Total GetItem duration
+- `partition_put_item`: Total PutItem duration
+- `partition_update_item`: Total UpdateItem duration
+- `partition_delete_item`: Total DeleteItem duration
+
+### Load Reporting
+
+```typescript
+// From src/partition-do.ts:48-57
+async reportLoad(requests: number, requestId?: string): Promise<void> {
+    const startMs = 0;
+    const t0 = Date.now();
+    this.loadCounter += requests;
+    const threshold = this.getReportLoadThreshold();
+    if (this.loadCounter > threshold) {
+        this.loadCounter = 0;
+    }
+    this.recordTrace(requestId, "partition_report_load", startMs, Date.now() - t0);
+}
+```
+
+Used for future hot partition detection and autoscaling.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Routing" icon="route" href="/architecture/routing">
+    Learn how requests reach the right DO
+  </Card>
+  <Card title="Consistency" icon="check-double" href="/architecture/consistency">
+    Understand consistency guarantees
+  </Card>
+</CardGroup>

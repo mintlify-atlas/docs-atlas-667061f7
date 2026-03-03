@@ -1,0 +1,320 @@
+---
+title: Observability and Tracing
+description: How to monitor shvm-db in production and understand request traces
+---
+
+## Overview
+
+shvm-db provides built-in distributed tracing for every request, allowing you to:
+
+- Understand where latency occurs in the request path
+- Debug performance issues
+- Monitor Durable Object health
+- Track cache hit rates
+
+All trace data is stored in a dedicated `TraceDO` Durable Object and retained for 2 hours.
+
+## Request Tracing
+
+### Trace Summary Headers
+
+Every API response includes a trace summary header:
+
+```
+X-SHIVAM-DB-Trace-Summary: worker_routing=0.23ms | partition_do_invoke=4.56ms | sqlite_query=1.23ms
+```
+
+This provides a quick latency breakdown without needing to fetch the full trace.
+
+### Trace Event Structure
+
+Each trace event captures:
+
+```typescript
+interface TraceEvent {
+  requestId: string;           // Unique request identifier
+  step: string;                // Operation name
+  startMs: number;             // Start time relative to request
+  durationMs: number;          // Duration in milliseconds
+  parent?: string;             // Parent step for nested operations
+  attributes?: Record<string, any>; // Additional metadata
+}
+```
+
+### Common Trace Steps
+
+| Step Name | Description |
+|-----------|-------------|
+| `client_to_worker` | Network latency from client to Cloudflare edge |
+| `worker_routing` | Time to compute partition hash and get DO stub |
+| `cache_check` | Cache API lookup (GetItem only) |
+| `partition_do_invoke` | Total time inside PartitionDO |
+| `sqlite_query` | SQLite execution time |
+| `condition_eval` | Condition expression evaluation |
+| `cache_populate` | Asynchronous cache write (not in critical path) |
+
+## Fetching Full Traces
+
+### Trace API Endpoint
+
+```
+GET /api/trace?requestId=<request-id>
+```
+
+### Example Request
+
+```bash
+curl "http://localhost:8787/api/trace?requestId=req_abc123"
+```
+
+### Example Response
+
+```json
+{
+  "requestId": "req_abc123",
+  "events": [
+    {
+      "requestId": "req_abc123",
+      "step": "client_to_worker",
+      "startMs": 0,
+      "durationMs": 2.34
+    },
+    {
+      "requestId": "req_abc123",
+      "step": "worker_routing",
+      "startMs": 2.34,
+      "durationMs": 0.12
+    },
+    {
+      "requestId": "req_abc123",
+      "step": "cache_check",
+      "startMs": 2.46,
+      "durationMs": 0.45,
+      "attributes": {
+        "hit": false
+      }
+    },
+    {
+      "requestId": "req_abc123",
+      "step": "partition_do_invoke",
+      "startMs": 2.91,
+      "durationMs": 5.67
+    },
+    {
+      "requestId": "req_abc123",
+      "step": "sqlite_query",
+      "startMs": 3.12,
+      "durationMs": 1.23,
+      "parent": "partition_do_invoke",
+      "attributes": {
+        "operation": "SELECT",
+        "table": "items_v3"
+      }
+    }
+  ],
+  "totalMs": 8.58
+}
+```
+
+## Trace Retention and Storage
+
+### TraceDO Architecture
+
+- **Single global TraceDO:** All trace events are stored in one Durable Object with ID `shvm-db-trace`
+- **Retention:** 2 hours (configurable in `trace-do.ts`)
+- **Storage:** SQLite with indexed queries on `request_id` and `created_at`
+- **Buffering:** Events are batched and flushed every 2 seconds to reduce write overhead
+
+### Schema
+
+```sql
+CREATE TABLE trace_events (
+  request_id TEXT,
+  step TEXT,
+  start_ms REAL,
+  duration_ms REAL,
+  parent TEXT,
+  attributes TEXT,  -- JSON
+  created_at INTEGER
+);
+
+CREATE INDEX idx_trace_events_request_id ON trace_events(request_id);
+CREATE INDEX idx_trace_events_created_at ON trace_events(created_at);
+```
+
+### Automatic Cleanup
+
+Old traces are deleted during:
+1. Scheduled alarm flush (every 2 seconds)
+2. Explicit `getTrace()` calls
+
+This keeps storage bounded without manual intervention.
+
+## Monitoring Key Metrics
+
+### Metrics Available in MVP
+
+| Metric | Source | How to Extract |
+|--------|--------|----------------|
+| Per-request latency | Trace summary header | Parse `X-SHIVAM-DB-Trace-Summary` |
+| Cache hit rate | Trace events | Count `cache_check` with `hit=true` |
+| SQLite query time | Trace events | Sum `sqlite_query` durations |
+| DO invocation overhead | Trace events | `partition_do_invoke` - `sqlite_query` |
+| Client network latency | Trace events | `client_to_worker` step |
+
+### Metrics NOT Available in MVP
+
+- Per-partition QPS (no aggregation layer)
+- WAL size tracking (SQLite internal)
+- DO restart count (no persistent counter)
+- Cross-request percentiles (requires external aggregation)
+
+These are explicitly out of scope for MVP but can be added with external monitoring tools.
+
+## Building a Monitoring Dashboard
+
+### Using Cloudflare Analytics
+
+Cloudflare Workers Analytics provides:
+- Request count
+- Error rate
+- CPU time (per worker invocation)
+- Subrequest count (DO invocations)
+
+Access via:
+1. Cloudflare Dashboard → Workers & Pages → Your Worker → Metrics
+2. GraphQL Analytics API
+
+### Custom Metrics Collector
+
+**Aggregate trace data externally:**
+
+```javascript
+// Periodically fetch recent traces
+const response = await fetch('https://your-worker.dev/api/trace?requestId=...');
+const trace = await response.json();
+
+// Extract metrics
+const totalLatency = trace.totalMs;
+const sqliteTime = trace.events
+  .filter(e => e.step === 'sqlite_query')
+  .reduce((sum, e) => sum + e.durationMs, 0);
+
+// Send to monitoring service (Datadog, Prometheus, etc.)
+```
+
+### Recommended External Tools
+
+| Tool | Use Case |
+|------|----------|
+| [Grafana](https://grafana.com/) | Visualize latency percentiles |
+| [Prometheus](https://prometheus.io/) | Store and query time-series metrics |
+| [Datadog](https://www.datadoghq.com/) | Full-stack observability |
+| [Sentry](https://sentry.io/) | Error tracking and alerting |
+
+## Debugging Performance Issues
+
+### High Latency Checklist
+
+1. **Check trace summary header:**
+   - Is `client_to_worker` high? Network issue.
+   - Is `sqlite_query` high? Database contention or large dataset.
+   - Is `partition_do_invoke` >> `sqlite_query`? DO overhead or cold start.
+
+2. **Fetch full trace:**
+   ```bash
+   curl "https://your-worker.dev/api/trace?requestId=<id>"
+   ```
+
+3. **Identify bottleneck:**
+   - `cache_check` with `hit=false`: Cache invalidation or miss
+   - `condition_eval` high: Complex condition expressions
+   - `sqlite_query` high: Query optimization needed
+
+### Example: Diagnosing Hot Partition
+
+**Symptoms:**
+- p99 latency > 50ms
+- `partition_do_invoke` highly variable
+- Same partition key in multiple slow requests
+
+**Solution:**
+- Distribute writes across more partition keys
+- Use Sort Key to split data within partition
+- Consider eventual consistency for reads (cache hits)
+
+## Alerting Strategies
+
+### Critical Alerts
+
+1. **Error rate > 5%**
+   - Check Cloudflare Analytics error rate
+   - Indicates systemic issue (DO crashes, SQLite corruption)
+
+2. **p99 latency > 100ms**
+   - Fetch traces for slow requests
+   - Likely hot partition or SQLite WAL checkpoint
+
+3. **Cache hit rate < 50% (for read-heavy workloads)**
+   - Indicates cache invalidation issues or cold cache
+
+### Warning Alerts
+
+1. **p95 latency > 30ms**
+   - Early warning of performance degradation
+
+2. **DO invocation time > 20ms (sustained)**
+   - Possible cold starts or overloaded partition
+
+## Trace Data Privacy
+
+### What is Stored
+
+- Request IDs (generated, not user-provided)
+- Operation names and durations
+- Metadata like table names and operation types
+
+### What is NOT Stored
+
+- Item values (PK, SK, attributes)
+- User credentials
+- Request payloads
+
+Trace data is safe to store without PII concerns in MVP.
+
+## Performance Overhead
+
+### Trace Collection Cost
+
+- **Per-request overhead:** ~0.1ms (in-memory event creation)
+- **Flush overhead:** Asynchronous, not in critical path
+- **Storage cost:** ~500 bytes per request × retention period
+
+### Disabling Tracing (Not Recommended)
+
+To disable tracing, comment out trace event recording in `src/index.ts`:
+
+```typescript
+// ctx.waitUntil(traceStub.recordEvents(traceEvents));
+```
+
+This saves ~0.1ms per request but removes all observability.
+
+## Future Observability Features
+
+These are planned but not in MVP:
+
+- Per-partition QPS dashboards
+- Real-time latency percentiles
+- WAL size monitoring
+- DO restart tracking
+- OpenTelemetry integration
+- Distributed trace correlation across services
+
+See [ROADMAP.md](https://github.com/shivamd20/shvm-db/blob/main/ROADMAP.md) for details.
+
+## Next Steps
+
+- Understand cost implications: [Cost Model](/operations/cost-model)
+- Learn about failure scenarios: [Fault Tolerance](/operations/fault-tolerance)
+- Benchmark your deployment: [Benchmarking](/operations/benchmarking)

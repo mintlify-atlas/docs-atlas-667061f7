@@ -1,0 +1,334 @@
+---
+title: Benchmarking with YCSB
+description: How to run Yahoo Cloud Serving Benchmark tests against shvm-db
+---
+
+## Overview
+
+shvm-db uses [YCSB (Yahoo Cloud Serving Benchmark)](https://github.com/brianfrankcooper/YCSB) to measure performance and compare against DynamoDB.
+
+YCSB is the industry-standard benchmarking tool for key-value stores and provides reproducible, comparable results.
+
+## Prerequisites
+
+### Requirements
+
+- Java 8 or higher
+- Python 3.x (for result processing)
+- Running shvm-db instance (local or deployed)
+- YCSB distribution (included in `benchmarks/ycsb-dist`)
+
+### Verify Java Installation
+
+```bash
+java -version
+```
+
+Expected output:
+```
+java version "1.8.0_XXX" or higher
+```
+
+## Quick Start
+
+### Run a Simple Benchmark
+
+From the repository root:
+
+```bash
+cd benchmarks
+./run_dynamo_compat.sh
+```
+
+This script:
+1. Creates the `usertable` table
+2. Loads 100 records
+3. Runs a balanced read/update workload
+4. Outputs results to `load_output.log` and `run_output.log`
+
+### Run All Benchmark Variants
+
+```bash
+cd benchmarks
+./run_benchmark.sh
+```
+
+This runs three workload variants:
+- **Variant A:** Hot partition stress test
+- **Variant B:** Sustained mixed load
+- **Variant C:** Concurrency scaling test
+
+## YCSB Workload Variants
+
+### Variant A: Hot Partition Stress Test
+
+**Purpose:** Expose single-partition performance ceiling.
+
+**Configuration:**
+```properties
+recordcount=500
+operationcount=3000
+readproportion=0.4
+updateproportion=0.4
+insertproportion=0.2
+requestdistribution=zipfian
+zipfianconstant=0.99
+threadcount=8
+```
+
+**Access Pattern:** Extreme skew (Zipfian 0.99) - most requests hit the same few keys.
+
+**Expected Outcome:**
+- High tail latency (p99 > 50ms)
+- Write throughput ceiling at ~1,000–2,000 ops/sec
+- Demonstrates hot partition problem
+
+### Variant B: Sustained Mixed Load Test
+
+**Purpose:** Simulate realistic SaaS workload.
+
+**Configuration:**
+```properties
+recordcount=2000
+operationcount=8000
+readproportion=0.6
+updateproportion=0.25
+insertproportion=0.15
+requestdistribution=latest
+threadcount=6
+```
+
+**Access Pattern:** Recent keys preferred (Latest) - mimics time-series access.
+
+**Expected Outcome:**
+- Moderate tail latency (p99 ~20–30ms)
+- Balanced read/write mix
+- Better performance than Variant A due to less contention
+
+### Variant C: Concurrency Scaling
+
+**Purpose:** Test throughput scaling with uniform distribution.
+
+**Configuration:**
+```properties
+recordcount=1500
+operationcount=6000
+readproportion=0.8
+updateproportion=0.15
+insertproportion=0.05
+requestdistribution=uniform
+threadcount=4
+```
+
+**Access Pattern:** Uniform distribution across all keys.
+
+**Expected Outcome:**
+- Best throughput (keys distributed across multiple partitions)
+- Low tail latency (p99 < 15ms)
+- Linear scaling with thread count (up to partition count)
+
+## Running Custom Workloads
+
+### YCSB Command Structure
+
+```bash
+./ycsb-dist/bin/ycsb.sh <load|run> dynamodb \
+  -P workloads/your_workload \
+  -p dynamodb.endpoint="http://localhost:8787/api" \
+  -p dynamodb.primaryKey=PK \
+  -p dynamodb.primaryKeyType=HASH \
+  -p dynamodb.awsCredentialsFile="fake-aws-credentials.properties" \
+  -s
+```
+
+### Load Phase
+
+Inserts initial dataset:
+
+```bash
+./ycsb-dist/bin/ycsb.sh load dynamodb \
+  -P workloads/variant_a \
+  -p dynamodb.endpoint="http://localhost:8787/api" \
+  -p dynamodb.primaryKey=PK \
+  -p dynamodb.primaryKeyType=HASH \
+  -s > load_results.txt
+```
+
+### Run Phase
+
+Executes benchmark operations:
+
+```bash
+./ycsb-dist/bin/ycsb.sh run dynamodb \
+  -P workloads/variant_a \
+  -p dynamodb.endpoint="http://localhost:8787/api" \
+  -p dynamodb.primaryKey=PK \
+  -p dynamodb.primaryKeyType=HASH \
+  -s > run_results.txt
+```
+
+## Creating Custom Workloads
+
+### Workload File Format
+
+Create a file in `benchmarks/workloads/`:
+
+```properties
+# Workload description
+workload=site.ycsb.workloads.CoreWorkload
+
+# Dataset size
+recordcount=1000
+operationcount=5000
+
+# Operation mix (must sum to 1.0)
+readproportion=0.5
+updateproportion=0.3
+insertproportion=0.2
+scanproportion=0.0
+
+# Access pattern
+# Options: uniform, zipfian, latest, hotspot
+requestdistribution=uniform
+
+# Concurrency
+threadcount=4
+
+# Measurements
+measurementtype=hdrhistogram
+hdrhistogram.percentiles=50,90,95,99,99.9
+```
+
+### Key Parameters
+
+| Parameter | Values | Effect |
+|-----------|--------|--------|
+| `requestdistribution` | `uniform` | All keys equally likely |
+|  | `zipfian` | Power-law distribution (hot keys) |
+|  | `latest` | Recent keys preferred |
+| `threadcount` | 1–32 | Concurrent client threads |
+| `recordcount` | Any integer | Number of records to load |
+| `operationcount` | Any integer | Total operations in run phase |
+
+## Understanding Results
+
+### Sample Output
+
+```
+[OVERALL], RunTime(ms), 12543
+[OVERALL], Throughput(ops/sec), 478.2
+[READ], Operations, 2400
+[READ], AverageLatency(us), 3421.2
+[READ], 95thPercentileLatency(us), 8192
+[READ], 99thPercentileLatency(us), 15360
+[UPDATE], Operations, 1200
+[UPDATE], AverageLatency(us), 5234.7
+[UPDATE], 95thPercentileLatency(us), 12288
+[UPDATE], 99thPercentileLatency(us), 24576
+```
+
+### Key Metrics
+
+| Metric | Interpretation |
+|--------|----------------|
+| `Throughput(ops/sec)` | Total operations per second |
+| `AverageLatency(us)` | Mean latency in microseconds |
+| `95thPercentileLatency(us)` | 95% of requests faster than this |
+| `99thPercentileLatency(us)` | Tail latency - critical for user experience |
+
+### What Good Looks Like
+
+**Uniform Distribution (Variant C):**
+- Throughput: 1,000–5,000 ops/sec
+- p95 latency: < 10ms
+- p99 latency: < 20ms
+
+**Hot Partition (Variant A):**
+- Throughput: 500–1,500 ops/sec
+- p95 latency: 15–30ms
+- p99 latency: 30–100ms
+
+## Comparing to DynamoDB
+
+### Run Against Real DynamoDB
+
+```bash
+./ycsb-dist/bin/ycsb.sh run dynamodb \
+  -P workloads/variant_a \
+  -p dynamodb.endpoint="https://dynamodb.us-east-1.amazonaws.com" \
+  -p dynamodb.awsCredentialsFile="real-credentials.properties" \
+  -s > dynamodb_results.txt
+```
+
+### Expected Differences
+
+| Aspect | shvm-db | DynamoDB |
+|--------|---------|----------|
+| Cold start latency | 50–200ms (first request) | ~5ms (pre-warmed) |
+| Hot partition ceiling | ~1,500 ops/sec | 1,000 WCU (similar) |
+| Uniform throughput | Linear with partitions | Linear with partitions |
+| Tail latency (p99) | 10–30ms | 5–15ms |
+
+## Automation and CI
+
+### Run Benchmarks in CI
+
+The `run_benchmark.sh` script supports:
+
+```bash
+# Run specific workloads
+./run_benchmark.sh -w variant_a,variant_c
+
+# Custom endpoint
+./run_benchmark.sh -e https://your-deployment.workers.dev/api
+
+# Only load data (no run phase)
+./run_benchmark.sh -o load
+```
+
+### Process Results Programmatically
+
+```python
+python3 process_results.py ./results/run_20260303_120000 ./public 20260303_120000
+```
+
+Generates JSON summaries for visualization.
+
+## Troubleshooting
+
+### "Table not found" errors
+
+Create the table before loading:
+
+```bash
+curl -X POST http://localhost:8787/api/ \
+  -H "x-amz-target: DynamoDB_20120810.CreateTable" \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -d '{
+    "TableName": "usertable",
+    "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}],
+    "AttributeDefinitions": [{"AttributeName": "PK", "AttributeType": "S"}]
+  }'
+```
+
+### Low throughput numbers
+
+Check:
+1. Thread count matches or exceeds partition count
+2. Request distribution is not all hitting one key
+3. Local `wrangler dev` vs deployed endpoint (local is faster)
+
+### Java heap errors
+
+Increase Java memory:
+
+```bash
+export JAVA_OPTS="-Xmx2g"
+./ycsb-dist/bin/ycsb.sh ...
+```
+
+## Next Steps
+
+- Understand performance results: [Performance Characteristics](/operations/performance)
+- Monitor production workloads: [Monitoring](/operations/monitoring)
+- Learn about cost implications: [Cost Model](/operations/cost-model)

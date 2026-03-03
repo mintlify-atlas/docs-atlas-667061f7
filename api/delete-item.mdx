@@ -1,0 +1,395 @@
+---
+title: DeleteItem
+description: Remove an item from a table by primary key with optional conditional checks
+---
+
+## Overview
+
+The `DeleteItem` operation deletes a single item from a table by primary key. You can optionally return the item's attributes as they appeared before deletion, or use condition expressions to delete only if certain conditions are met.
+
+## Request Structure
+
+```json
+{
+  "TableName": "string",
+  "Key": {
+    "AttributeName": AttributeValue,
+    ...
+  },
+  "ConditionExpression": "string",
+  "ExpressionAttributeNames": {
+    "#placeholder": "AttributeName",
+    ...
+  },
+  "ExpressionAttributeValues": {
+    ":value": AttributeValue,
+    ...
+  },
+  "ReturnValues": "NONE" | "ALL_OLD"
+}
+```
+
+## Parameters
+
+<ParamField path="TableName" type="string" required>
+  The name of the table from which to delete the item.
+</ParamField>
+
+<ParamField path="Key" type="object" required>
+  A map of attribute names to AttributeValue objects representing the primary key of the item to delete.
+  
+  - For partition key only tables: Provide just the partition key
+  - For composite key tables: Provide both partition key and sort key
+</ParamField>
+
+<ParamField path="ConditionExpression" type="string">
+  A condition that must be satisfied for the delete operation to succeed. The delete fails if the condition evaluates to false.
+  
+  Common use cases:
+  - Delete only if item exists: `attribute_exists(userId)`
+  - Conditional delete based on status: `#status = :expected`
+  - Version-based deletion: `#version = :expectedVersion`
+</ParamField>
+
+<ParamField path="ExpressionAttributeNames" type="object">
+  A map of placeholder names to actual attribute names. Use this to reference:
+  - Reserved words in DynamoDB
+  - Attribute names with special characters
+  - Attributes used multiple times in expressions
+</ParamField>
+
+<ParamField path="ExpressionAttributeValues" type="object">
+  A map of placeholder values used in the condition expression.
+  
+  Example: `{":active": {"S": "ACTIVE"}, ":min": {"N": "0"}}`
+</ParamField>
+
+<ParamField path="ReturnValues" type="string">
+  Determines what values are returned after the delete operation:
+  
+  - `NONE` (default): Nothing is returned
+  - `ALL_OLD`: Returns the item as it appeared before deletion
+</ParamField>
+
+## Response Structure
+
+```json
+{
+  "Attributes": {
+    "AttributeName": AttributeValue,
+    ...
+  }
+}
+```
+
+<ResponseField name="Attributes" type="object">
+  The attribute values as they appeared before the item was deleted. Only returned if `ReturnValues` is set to `ALL_OLD` and the item existed.
+</ResponseField>
+
+## Examples
+
+### Basic Delete
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    }
+  }'
+```
+
+**Response:**
+```json
+{}
+```
+
+### Delete with Return Values
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "ReturnValues": "ALL_OLD"
+  }'
+```
+
+**Response:**
+```json
+{
+  "Attributes": {
+    "userId": {"S": "user123"},
+    "email": {"S": "user@example.com"},
+    "status": {"S": "ACTIVE"},
+    "createdAt": {"N": "1677649200"}
+  }
+}
+```
+
+### Conditional Delete
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "ConditionExpression": "#status = :inactive",
+    "ExpressionAttributeNames": {
+      "#status": "status"
+    },
+    "ExpressionAttributeValues": {
+      ":inactive": {"S": "INACTIVE"}
+    }
+  }'
+```
+
+This delete only succeeds if the user's status is "INACTIVE".
+
+### Delete with Version Check (Optimistic Locking)
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "ConditionExpression": "#version = :expectedVersion",
+    "ExpressionAttributeNames": {
+      "#version": "version"
+    },
+    "ExpressionAttributeValues": {
+      ":expectedVersion": {"N": "5"}
+    },
+    "ReturnValues": "ALL_OLD"
+  }'
+```
+
+### Delete Only If Exists
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "ConditionExpression": "attribute_exists(userId)"
+  }'
+```
+
+This prevents the operation from succeeding when the item doesn't exist (otherwise, DeleteItem on non-existent items succeeds silently).
+
+### Delete with Composite Key
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.DeleteItem" \
+  -d '{
+    "TableName": "Orders",
+    "Key": {
+      "customerId": {"S": "customer456"},
+      "orderId": {"S": "order789"}
+    },
+    "ConditionExpression": "#status IN (:cancelled, :completed)",
+    "ExpressionAttributeNames": {
+      "#status": "status"
+    },
+    "ExpressionAttributeValues": {
+      ":cancelled": {"S": "CANCELLED"},
+      ":completed": {"S": "COMPLETED"}
+    }
+  }'
+```
+
+## Error Responses
+
+### ConditionalCheckFailedException
+
+Returned when the condition expression evaluates to false.
+
+```json
+{
+  "__type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed"
+}
+```
+
+**Status Code:** 400
+
+Common scenarios:
+- Item exists but condition doesn't match
+- Version mismatch in optimistic locking
+- Using `attribute_exists()` when item doesn't exist
+
+### ValidationException
+
+Returned when the request is malformed.
+
+```json
+{
+  "__type": "ValidationException",
+  "message": "One of the required keys was not given a value"
+}
+```
+
+**Status Code:** 400
+
+Common causes:
+- Missing key attributes
+- Empty string value for key attribute
+- Type mismatch for key attribute
+- Invalid ConditionExpression syntax
+
+### ResourceNotFoundException
+
+Returned when the specified table does not exist.
+
+```json
+{
+  "__type": "ResourceNotFoundException",
+  "message": "Cannot do operations on a non-existent table"
+}
+```
+
+**Status Code:** 400
+
+## Implementation Details
+
+### Delete Execution Flow
+
+The `DeleteItem` operation follows this sequence:
+
+1. **Condition Evaluation** (if `ConditionExpression` or `ReturnValues=ALL_OLD`):
+   - Fetch current item from SQLite
+   - Evaluate condition expression against current item
+   - Throw `ConditionalCheckFailedException` if condition fails
+
+2. **Mark as Deleted**: Insert tombstone record
+   ```sql
+   INSERT OR REPLACE INTO items_v3 (id, version, value, deleted) VALUES (?, 1, NULL, 1)
+   ```
+
+3. **Cache Invalidation**: Write tombstone to edge cache (5-minute TTL)
+   - Prevents unnecessary Durable Object invocations for deleted items
+
+4. **Return Response**: Return old attributes if requested
+
+See [partition-do.ts:113-140](https://github.com/shivamd20/shvm-db/blob/main/src/partition-do.ts#L113-L140) for the implementation.
+
+### Tombstone Architecture
+
+Deleted items are marked with a tombstone (`deleted=1`) rather than being physically removed. This approach:
+
+- ✅ Enables fast "item not found" responses from cache
+- ✅ Preserves audit trail and version history
+- ✅ Allows future recovery or replication features
+- ❌ Accumulates storage (future: compaction needed)
+
+### Idempotency
+
+Deleting a non-existent item succeeds silently and returns:
+```json
+{}
+```
+
+To detect this case, use:
+- `ConditionExpression: attribute_exists(primaryKey)`, or
+- `ReturnValues: ALL_OLD` and check if `Attributes` is present
+
+### Cache Behavior
+
+After a successful delete:
+
+1. A tombstone is written to Cloudflare Cache API (TTL: 5 minutes)
+2. Subsequent `GetItem` requests return cache miss without waking the Durable Object
+3. Tombstone expires after 5 minutes, then cache misses fetch from SQLite
+
+This prevents the "thundering herd" problem when repeatedly reading recently deleted items.
+
+## Performance Characteristics
+
+| Metric | Expected Range |
+|--------|----------------|
+| Latency | 3-10ms |
+| Throughput (per partition) | 500-2,000 ops/sec |
+
+Performance considerations:
+- Conditional deletes are slower (require read before delete)
+- `ReturnValues=ALL_OLD` adds read overhead
+- Unconditional deletes without return values are fastest
+
+## Best Practices
+
+### Soft Deletes
+
+For audit trails or recovery, implement soft deletes using UpdateItem:
+
+```json
+{
+  "UpdateExpression": "SET #deleted = :true, #deletedAt = :timestamp",
+  "ExpressionAttributeNames": {
+    "#deleted": "isDeleted",
+    "#deletedAt": "deletedAt"
+  },
+  "ExpressionAttributeValues": {
+    "::true": {"BOOL": true},
+    ":timestamp": {"N": "1677649200"}
+  }
+}
+```
+
+Then filter deleted items in your application logic.
+
+### Cascade Deletes
+
+DynamoDB (and shvm-db) doesn't support automatic cascade deletes. To delete related items:
+
+1. Query for related items (when Query is implemented)
+2. Delete each item individually
+3. Consider using a background job for large cascades
+
+### Optimistic Locking
+
+Prevent accidental deletion of modified items:
+
+```json
+{
+  "Key": {"userId": {"S": "user123"}},
+  "ConditionExpression": "#version = :expectedVersion",
+  "ExpressionAttributeNames": {"#version": "version"},
+  "ExpressionAttributeValues": {":expectedVersion": {"N": "3"}}
+}
+```
+
+## Differences from DynamoDB
+
+| Feature | DynamoDB | shvm-db |
+|---------|----------|----------|
+| Tombstone storage | No (physical delete) | Yes (logical delete with `deleted=1`) |
+| ReturnValues options | NONE, ALL_OLD | NONE, ALL_OLD (fully supported) |
+| Capacity units | Consumes 1 WCU | N/A (pay-per-execution) |
+| Conditional failures | No charge | Still consumes Durable Object time |
+
+## Related Operations
+
+- [GetItem](/api/get-item) - Retrieve an item
+- [PutItem](/api/put-item) - Create or replace an item
+- [UpdateItem](/api/update-item) - Modify specific attributes

@@ -1,0 +1,204 @@
+---
+title: Performance Characteristics
+description: Expected latency, throughput, and bottlenecks in shvm-db
+---
+
+## Overview
+
+shvm-db's performance is fundamentally constrained by three architectural choices:
+
+1. **Single-threaded execution per partition** - Each Durable Object runs on one JavaScript isolate
+2. **SQLite serialization** - All writes must pass through SQLite's transaction lock
+3. **No partition splitting** - Static partition boundaries create hard performance ceilings
+
+These constraints mirror DynamoDB's original 1,000 WCU per partition limit and are **intentional design decisions** for the MVP.
+
+## Per-Partition Performance
+
+### Single Durable Object Limits
+
+Each partition (one Durable Object + one SQLite database) has the following expected performance:
+
+| Metric           | Expected Range | Notes |
+|------------------|----------------|-------|
+| Write latency    | 3–10 ms        | Includes SQLite WAL commit |
+| Read latency (cache miss) | 2–8 ms | Direct SQLite SELECT |
+| Read latency (cache hit) | < 1 ms | Edge cache, DO not invoked |
+| Write throughput | 500–2,000 ops/sec | Single-threaded ceiling |
+| Read throughput  | 2,000–10,000 ops/sec | Limited by SQLite + isolate |
+
+These numbers reflect pure SQLite performance plus Cloudflare Durable Object invocation overhead.
+
+### Local Performance (Development)
+
+When running locally with `wrangler dev`:
+
+| Metric           | Expected |
+|------------------|----------|
+| Write latency    | 1–5 ms   |
+| Read latency (hot) | < 1 ms |
+| Read latency (cold) | 3–10 ms |
+| Write throughput | 1,000–5,000 ops/sec |
+| Read throughput  | 5,000–20,000 ops/sec |
+
+Local performance is typically better due to reduced network overhead and faster disk I/O.
+
+## System-Wide Throughput
+
+### Linear Scaling Model
+
+Total system throughput scales **linearly with the number of unique partition keys**:
+
+```
+Theoretical Max Throughput = Partitions × Per-Partition Throughput
+```
+
+**Examples:**
+- 10 partitions → ~10,000 writes/sec
+- 100 partitions → ~100,000 writes/sec  
+- 1,000 partitions → ~1,000,000 writes/sec (theoretical)
+
+This assumes uniform distribution. Hot keys destroy this scaling.
+
+## Known Bottlenecks
+
+### 1. Hot Partition Problem
+
+**Symptom:** Many requests to the same partition key.
+
+**Impact:** Hard ceiling at ~1,000–2,000 ops/sec for that partition.
+
+**Why:** Single-threaded Event Loop + SQLite lock contention force sequential execution.
+
+**Example:**
+```json
+// All these requests hit the SAME Durable Object
+{"PK": "user#12345", ...}
+{"PK": "user#12345", ...}
+{"PK": "user#12345", ...}
+```
+
+**Mitigation:** Distribute writes across multiple partition keys. No automatic splitting in MVP.
+
+### 2. SQLite Write Serialization
+
+**What happens:**
+Every `PutItem`, `UpdateItem`, or `DeleteItem` executes:
+```sql
+INSERT OR REPLACE INTO items_v3 (id, version, value, deleted) VALUES (?, ?, ?, ?)
+```
+
+During the commit phase, SQLite's WAL lock prevents concurrent writes within the same DO.
+
+**Impact:** Write throughput ceiling even with async JavaScript.
+
+### 3. WAL Growth Under Heavy Load
+
+**Condition:** Sustained high write throughput (>1,000 ops/sec).
+
+**Effect:** SQLite WAL file grows, increasing checkpoint time.
+
+**Recovery:** SQLite automatically checkpoints, but this briefly blocks writes.
+
+### 4. Cold Start Overhead
+
+**When:** First request to a Durable Object after inactivity.
+
+**Latency Impact:** +50–200ms for DO initialization + SQLite open.
+
+**Frequency:** Rare in production with steady traffic. Common in testing.
+
+## Cache Performance
+
+### Edge Cache Layer
+
+shvm-db uses Cloudflare's Cache API as a write-through cache:
+
+| Operation | Cache Behavior | TTL |
+|-----------|----------------|-----|
+| `GetItem` | Cached on read | 5 minutes |
+| `PutItem` | Invalidated synchronously | N/A |
+| `UpdateItem` | Invalidated synchronously | N/A |
+| `DeleteItem` | Invalidated synchronously | N/A |
+| `DescribeTable` | Cached | 2 hours |
+
+**Cache Hit Performance:**
+- Latency: < 1ms (no DO invocation)
+- Throughput: Thousands of requests/sec per edge location
+
+**Cache Miss:**
+- Falls through to PartitionDO
+- Populates cache via `ctx.waitUntil` after response
+
+## Comparison to DynamoDB
+
+### Similar Characteristics
+
+| Aspect | shvm-db | DynamoDB |
+|--------|---------|----------|
+| Per-partition write limit | ~1,000–2,000 ops/sec | 1,000 WCU/partition |
+| Hot partition problem | Yes | Yes |
+| Scaling model | Linear with partitions | Linear with partitions |
+| Cold start | Yes (rare) | No (pre-warmed) |
+
+### Key Differences
+
+| Aspect | shvm-db | DynamoDB |
+|--------|---------|----------|
+| Storage engine | SQLite | Proprietary |
+| Automatic partition splitting | No (MVP) | Yes |
+| Global distribution | Single-region* | Multi-region |
+| Burst capacity | No | Yes |
+
+*Durable Objects run in the region closest to the first request but remain there.
+
+## Performance Testing
+
+See [Benchmarking](/operations/benchmarking) for how to run YCSB tests and measure your own performance characteristics.
+
+## Performance Tuning
+
+### Application-Level Strategies
+
+1. **Distribute partition keys uniformly**
+   - Use high-cardinality keys
+   - Avoid sequential IDs for high-write entities
+
+2. **Batch reads where possible**
+   - Group related items under the same partition key
+   - Use Sort Key for range queries (when supported)
+
+3. **Leverage cache for read-heavy workloads**
+   - Design for eventual consistency where acceptable
+   - 5-minute cache TTL reduces DO invocations significantly
+
+4. **Avoid cross-partition transactions**
+   - Not supported in MVP
+   - Design single-partition operations
+
+### Infrastructure-Level Options
+
+**None in MVP.** The following are explicitly out of scope:
+- Provisioned capacity
+- Auto-scaling
+- Partition splitting
+- Read replicas
+
+This is intentional simplicity.
+
+## Expected Failure Modes
+
+These are **known and accepted** in the MVP:
+
+1. **Hot partition saturation** - Single partition cannot exceed ~2,000 writes/sec
+2. **No burst handling** - Sudden traffic spikes queue at the Durable Object
+3. **WAL checkpoint delays** - Brief pauses during heavy write periods
+4. **No fast recovery** - Crashed DOs restart from SQLite state (no external WAL replay)
+
+See [Fault Tolerance](/operations/fault-tolerance) for detailed failure scenarios.
+
+## Next Steps
+
+- Learn how to measure performance: [Benchmarking](/operations/benchmarking)
+- Understand cost implications: [Cost Model](/operations/cost-model)
+- Monitor production systems: [Monitoring](/operations/monitoring)

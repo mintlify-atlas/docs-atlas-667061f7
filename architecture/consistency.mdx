@@ -1,0 +1,525 @@
+---
+title: Consistency Model
+description: Consistency guarantees, trade-offs, and limitations in shvm-db
+---
+
+## Overview
+
+shvm-db provides **strong consistency per partition**, mirroring DynamoDB's consistency model. Understanding the guarantees and limitations is critical for building correct applications.
+
+## Consistency Guarantees
+
+### Strong Consistency Per Partition
+
+✅ **Within a Single Partition Key:**
+
+- **Read-after-write consistency**: Reads always see committed writes
+- **Serializable isolation**: All operations execute in order
+- **No lost updates**: Concurrent updates cannot overwrite each other
+- **Atomic operations**: Each operation fully completes or fails
+
+**Example:**
+
+```typescript
+// User A and User B both increment counter for same partition key
+
+// Without single-writer (traditional DB)
+A: Read counter=10
+B: Read counter=10     ← Both read same value
+A: Write counter=11
+B: Write counter=11    ← Lost update! ❌
+
+// With single-writer (shvm-db)
+A: Read counter=10
+A: Write counter=11    ✅
+B: Read counter=11     ← Waits for A, sees latest value
+B: Write counter=12    ✅
+```
+
+### Read-After-Write Consistency
+
+```typescript
+// Write an item
+await client.putItem({
+  TableName: "Users",
+  Item: { UserId: { S: "user123" }, Name: { S: "Alice" } }
+});
+
+// Immediately read it back
+const result = await client.getItem({
+  TableName: "Users",
+  Key: { UserId: { S: "user123" } }
+});
+
+// ✅ Guaranteed to see "Alice" (not old value or null)
+```
+
+**How it's achieved:**
+
+1. PutItem writes to SQLite in PartitionDO
+2. SQLite commit completes
+3. PutItem returns success
+4. Worker updates edge cache
+5. GetItem checks edge cache (sees new value)
+6. Or GetItem goes to DO (sees committed write in SQLite)
+
+### Conditional Operations
+
+Condition expressions provide atomic compare-and-swap:
+
+```typescript
+// Only update if current value matches expectation
+await client.updateItem({
+  TableName: "Inventory",
+  Key: { ProductId: { S: "product-123" } },
+  UpdateExpression: "SET stock = stock - :qty",
+  ConditionExpression: "stock >= :qty",
+  ExpressionAttributeValues: {
+    ":qty": { N: "5" }
+  }
+});
+
+// ✅ Atomic: Either entire operation succeeds or fails
+// ✅ No partial updates
+// ✅ No race conditions
+```
+
+**Implementation:**
+
+```typescript
+// From src/partition-do.ts:93-103
+if (conditionExpression) {
+    const currentItem = await this._getItemLocally(doKey, requestId);
+    try {
+        const pass = evaluateCondition(
+            currentItem, 
+            conditionExpression, 
+            expressionAttributeNames, 
+            expressionAttributeValues
+        );
+        if (!pass) throw new Error("The conditional request failed");
+    } catch (e: any) {
+        const err = new Error(e.message);
+        err.name = "ConditionalCheckFailedException";
+        throw err;
+    }
+}
+
+// Only reaches here if condition passed
+this.sql.exec(PartitionDOQueries.Items.INSERT, doKey, 1, JSON.stringify(value), 0);
+```
+
+### Serialized Execution
+
+All operations on a partition execute sequentially:
+
+```
+Request Queue for Partition 42:
+┌─────────────────────────────────────┐
+│ 1. PutItem (user123)    ← Executing │
+│ 2. GetItem (user123)    ← Waiting   │
+│ 3. UpdateItem (user123) ← Waiting   │
+│ 4. DeleteItem (user123) ← Waiting   │
+└─────────────────────────────────────┘
+
+→ Request 2 cannot start until Request 1 completes
+→ Prevents all race conditions
+→ Guarantees ordering
+```
+
+## What's NOT Guaranteed
+
+### ❌ Cross-Partition Consistency
+
+**No guarantees across different partition keys:**
+
+```typescript
+// Write to partition A
+await client.putItem({
+  TableName: "Orders",
+  Item: { OrderId: { S: "order-1" }, Status: { S: "paid" } }
+});
+
+// Write to partition B
+await client.putItem({
+  TableName: "Orders",
+  Item: { OrderId: { S: "order-2" }, Status: { S: "paid" } }
+});
+
+// ❌ No guarantee that both writes are visible simultaneously
+// ❌ No guarantee about relative ordering
+// ❌ No atomic commit across both partitions
+```
+
+**Why:**
+- Different partition keys → different DOs
+- DOs are independent
+- No distributed transaction coordinator (MVP)
+- No two-phase commit
+
+### ❌ Global Ordering
+
+**No total order across all operations:**
+
+```typescript
+// Client A writes to partition 1
+A: PutItem(pk="user1", timestamp=T1)
+
+// Client B writes to partition 2
+B: PutItem(pk="user2", timestamp=T2)
+
+// ❌ Cannot determine which happened first globally
+// ✅ But each partition has consistent local ordering
+```
+
+### ❌ Read-Your-Writes Across Partitions
+
+**Same client may see inconsistent state:**
+
+```typescript
+// Write to user's account
+await client.putItem({
+  TableName: "Accounts",
+  Item: { AccountId: { S: "acc-1" }, Balance: { N: "100" } }
+});
+
+// Write to user's profile (different partition)
+await client.putItem({
+  TableName: "Users",
+  Item: { UserId: { S: "user-1" }, AccountId: { S: "acc-1" } }
+});
+
+// Read user profile
+const user = await client.getItem({
+  TableName: "Users",
+  Key: { UserId: { S: "user-1" } }
+});
+// ✅ Sees AccountId: acc-1
+
+// Read account
+const account = await client.getItem({
+  TableName: "Accounts",
+  Key: { AccountId: { S: "acc-1" } }
+});
+// ❌ Might not see Balance: 100 yet (different partition)
+```
+
+## Edge Cache Consistency
+
+### Write-Through Cache
+
+**Maintains strong consistency:**
+
+```typescript
+// From src/index.ts:249-252
+const res: any = await pStub.handlePutItem(...); // Write to DO (source of truth)
+
+// Write-through cache up to edge after DO confirms write
+await cacheManager.putItem(ctx, "item", doKey, body.Item, 300);
+```
+
+**Sequence:**
+1. Write request arrives
+2. Worker invokes PartitionDO
+3. DO writes to SQLite
+4. SQLite commit succeeds
+5. DO returns success
+6. Worker updates edge cache
+7. Worker returns success to client
+
+**Guarantee:** Cache never contains data that's not in SQLite.
+
+### Cache Invalidation on Delete
+
+```typescript
+// From src/index.ts:270
+// Write tombstone to edge cache
+await cacheManager.deleteItem(ctx, "item", doKey, 300);
+```
+
+**Why Tombstone:**
+- Prevents resurrection of deleted items
+- Avoids serving stale data from cache
+- TTL ensures eventual cleanup
+
+### Cache Miss Behavior
+
+```typescript
+// From src/index.ts:317-336
+const { hit, deleted, data } = await cacheManager.getItemRaw("item", doKey);
+
+if (hit) {
+    // Serve from cache
+    if (!deleted) item = data;
+} else {
+    // Cache miss: Query DO
+    item = await pStub.handleGetItem(doKey, requestId, Date.now());
+    
+    // Update cache for next request
+    if (item) {
+        await cacheManager.putItem(ctx, "item", doKey, item, 300);
+    } else {
+        await cacheManager.deleteItem(ctx, "item", doKey, 300);
+    }
+}
+```
+
+**Consistency property:** Cache misses always go to authoritative source (DO → SQLite).
+
+## SQLite ACID Guarantees
+
+Each PartitionDO's SQLite database provides full ACID:
+
+### Atomicity
+
+```typescript
+// Single operation is atomic
+this.sql.exec(
+  "INSERT OR REPLACE INTO items_v3 (id, version, value, deleted) VALUES (?, ?, ?, ?)",
+  doKey, 1, JSON.stringify(value), 0
+);
+
+// ✅ Either entire row is written or none
+// ✅ No partial writes
+// ✅ No torn reads
+```
+
+### Consistency
+
+- SQLite enforces PRIMARY KEY constraint
+- Type safety within BLOB field
+- Schema migrations run atomically
+
+### Isolation
+
+SQLite in WAL mode:
+
+```
+Writer: INSERT OR REPLACE into WAL
+Reader: Reads from snapshot (before WAL)
+
+→ Readers never block writers
+→ Writers never block readers
+→ Single writer per DB (enforced by DO)
+```
+
+### Durability
+
+- SQLite WAL persists to disk before commit returns
+- Cloudflare Durable Object storage is durable
+- Survives DO restart/crash
+- No data loss after successful commit
+
+**Failure scenario:**
+
+```typescript
+// Request writes to SQLite
+this.sql.exec("INSERT OR REPLACE ...");
+
+// DO crashes immediately after commit
+// ↓
+// DO restarts, opens SQLite
+// ✅ Write is still there (WAL recovery)
+```
+
+## Failure Modes and Consistency
+
+### Worker Crash During Write
+
+**Scenario:**
+```
+1. Client sends PutItem
+2. Worker invokes DO
+3. DO writes to SQLite ✅
+4. DO returns success
+5. Worker crashes before returning to client ❌
+6. Client sees timeout/error
+```
+
+**Result:**
+- ✅ Data is safely in SQLite (durable)
+- ❌ Client doesn't know
+- ⚠️ Client must retry (idempotency recommended)
+
+**Mitigation:**
+```typescript
+// Use conditional writes for idempotency
+await client.putItem({
+  TableName: "Orders",
+  Item: { OrderId: { S: "order-123" }, ... },
+  ConditionExpression: "attribute_not_exists(OrderId)"
+  // Only succeeds on first write, retries are safe
+});
+```
+
+### DO Crash During Write
+
+**Scenario:**
+```
+1. Worker invokes DO
+2. DO starts SQLite transaction
+3. DO crashes mid-write ❌
+```
+
+**Result:**
+- ✅ SQLite rolls back incomplete transaction
+- ✅ No partial writes
+- ✅ No corruption
+- ⚠️ Client sees error, must retry
+
+### Cache Inconsistency
+
+**Scenario:**
+```
+1. Write succeeds in DO
+2. Cache update fails (network issue)
+3. Cache has stale data
+```
+
+**Mitigation:**
+- Cache has TTL (5 minutes)
+- Stale data eventually expires
+- Consistency eventually restored
+
+**Trade-off:**
+- Temporary inconsistency acceptable
+- Performance gain outweighs risk
+- Application can force fresh read if needed
+
+## Consistency Comparison
+
+### shvm-db vs DynamoDB
+
+| Feature | DynamoDB | shvm-db |
+|---------|----------|----------|
+| Per-partition consistency | Strong | Strong |
+| Read-after-write | Strong | Strong |
+| Cross-partition consistency | Eventually consistent | No guarantee |
+| Global secondary indexes | Eventually consistent | Not supported (MVP) |
+| Transactions (cross-partition) | Strong (via 2PC) | Not supported (MVP) |
+| Conditional operations | Strong | Strong |
+
+### shvm-db vs PostgreSQL
+
+| Feature | PostgreSQL | shvm-db |
+|---------|------------|----------|
+| Single-row consistency | Strong (MVCC) | Strong (single-writer) |
+| Multi-row transactions | Strong (2PL/MVCC) | Not supported (MVP) |
+| Cross-table consistency | Strong | No guarantee |
+| Isolation levels | Multiple (Read Committed, Serializable, etc.) | Serializable (per partition) |
+| Read scaling | Replicas (eventual) | Edge cache (TTL-based) |
+
+## Best Practices
+
+### ✅ Design for Single-Partition Operations
+
+**Good:**
+```typescript
+// Update user's profile (single partition)
+await client.updateItem({
+  TableName: "Users",
+  Key: { UserId: { S: "user-123" } },
+  UpdateExpression: "SET profileViews = profileViews + :inc",
+  ExpressionAttributeValues: { ":inc": { N: "1" } }
+});
+// ✅ Strong consistency guaranteed
+```
+
+**Bad:**
+```typescript
+// Update two users' profiles (two partitions)
+await client.updateItem(/* user-123 */); // Partition A
+await client.updateItem(/* user-456 */); // Partition B
+// ❌ No atomicity across partitions
+// ❌ Partial failure possible
+```
+
+### ✅ Use Conditional Writes for Coordination
+
+```typescript
+// Implement distributed lock using conditional write
+await client.putItem({
+  TableName: "Locks",
+  Item: { 
+    LockId: { S: "resource-123" },
+    Owner: { S: "worker-A" },
+    ExpiresAt: { N: String(Date.now() + 30000) }
+  },
+  ConditionExpression: "attribute_not_exists(LockId) OR ExpiresAt < :now",
+  ExpressionAttributeValues: { ":now": { N: String(Date.now()) } }
+});
+// ✅ Atomic lock acquisition
+// ✅ Only one worker succeeds
+```
+
+### ✅ Accept Eventual Consistency Across Partitions
+
+```typescript
+// Write to user's order
+await client.putItem({
+  TableName: "Orders",
+  Item: { OrderId: { S: "order-123" }, UserId: { S: "user-123" }, ... }
+});
+
+// Write to user's order history (different partition)
+await client.putItem({
+  TableName: "Users",
+  Item: { UserId: { S: "user-123" }, LastOrderId: { S: "order-123" } }
+});
+
+// ⚠️ Accept that these two writes are not atomic
+// ✅ Design application to handle partial failure
+// ✅ Use retry logic or reconciliation job
+```
+
+### ❌ Don't Assume Cross-Partition Ordering
+
+```typescript
+// BAD: Assuming order is preserved
+await client.putItem({ /* partition A */ });
+await client.putItem({ /* partition B */ });
+// Another client reads partition B, then partition A
+// ❌ May see B's write but not A's write
+
+// GOOD: Make operations independent
+// Or denormalize data to same partition key
+```
+
+## Future: Transactions
+
+Planned for future versions:
+
+### Two-Phase Commit (2PC)
+
+```typescript
+// Future API (not in MVP)
+await client.transactWriteItems({
+  TransactItems: [
+    { Put: { TableName: "Accounts", Item: { ... } } },  // Partition A
+    { Put: { TableName: "Ledger", Item: { ... } } }     // Partition B
+  ]
+});
+// ✅ Atomic across partitions
+// ✅ All succeed or all fail
+```
+
+**Implementation challenges:**
+- Coordinator DO to manage transaction
+- Two-phase protocol (prepare + commit)
+- Deadlock detection
+- Timeout handling
+- Performance impact
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="code" href="/api/put-item">
+    Explore DynamoDB operations
+  </Card>
+  <Card title="Deployment Guide" icon="wrench" href="/deployment">
+    Deploy and monitor in production
+  </Card>
+  <Card title="Performance Guide" icon="wrench" href="/operations/performance">
+    Best practices for production
+  </Card>
+</CardGroup>

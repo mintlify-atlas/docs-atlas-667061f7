@@ -1,0 +1,536 @@
+---
+title: Compatibility Testing
+description: Learn how shvm-db maintains DynamoDB compatibility through comprehensive testing against DynamoDB Local
+---
+
+shvm-db uses a rigorous compatibility testing framework that runs every operation against both shvm-db and DynamoDB Local (the "oracle"), comparing responses to ensure exact API compatibility.
+
+## Testing Philosophy
+
+The test suite validates that shvm-db behaves **identically** to DynamoDB:
+
+- Same response structure
+- Same error messages and types
+- Same edge case behavior
+- Same validation rules
+
+This approach ensures developers can use shvm-db as a drop-in replacement without behavioral surprises.
+
+## Test Harness Architecture
+
+The `executeAgainstBoth` function is the core of the testing framework:
+
+```typescript
+// From compat-test/src/testHarness.ts:35-61
+export async function executeAgainstBoth(
+  commandFactory: (client: DynamoDBClient) => Promise<any>
+) {
+  const { oracleClient, testClient } = getClients();
+
+  let oracleResult, testResult;
+  let oracleError, testError;
+
+  try {
+    oracleResult = await commandFactory(oracleClient);
+  } catch (e) {
+    oracleError = e;
+  }
+
+  try {
+    testResult = await commandFactory(testClient);
+  } catch (e) {
+    testError = e;
+  }
+
+  if (oracleError || testError) {
+    // If one errors and the other doesn't, we want compareError to fail
+    compareError(oracleError, testError);
+  } else {
+    compare(oracleResult, testResult);
+  }
+}
+```
+
+### Client Configuration
+
+Two clients are configured to point at different endpoints:
+
+```typescript
+// From compat-test/src/testHarness.ts:15-33
+export function getClients() {
+  if (!oracleClient || !testClient) {
+    let oraclePort = parseInt(process.env.ORACLE_PORT || "8000", 10);
+    let testPort = parseInt(process.env.TEST_PORT || "8787", 10);
+
+    try {
+      const portsStr = fs.readFileSync(
+        path.resolve(__dirname, "../.test-ports.json"), 
+        "utf8"
+      );
+      const parsed = JSON.parse(portsStr);
+      if (parsed.oraclePort) oraclePort = parsed.oraclePort;
+      if (parsed.testPort) testPort = parsed.testPort;
+    } catch (e) {
+      // ignore
+    }
+
+    oracleClient = createTestClient(oraclePort, "/");
+    testClient = createTestClient(testPort, "/api/");
+  }
+  return { oracleClient, testClient };
+}
+```
+
+## Test Categories
+
+### Table Management Tests
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:9-18
+test("CreateTable", async () => {
+  await executeAgainstBoth((client) =>
+    client.send(new CreateTableCommand({
+      TableName: tableName,
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }))
+  );
+});
+```
+
+### Duplicate Table Detection
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:20-29
+test("CreateTable - Duplicate", async () => {
+  await executeAgainstBoth((client) =>
+    client.send(new CreateTableCommand({
+      TableName: tableName,
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }))
+  );
+});
+```
+
+<Info>
+This test expects both implementations to throw the same error when creating a duplicate table.
+</Info>
+
+### DescribeTable Tests
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:31-37
+test("DescribeTable", async () => {
+  await executeAgainstBoth((client) =>
+    client.send(new DescribeTableCommand({
+      TableName: tableName,
+    }))
+  );
+});
+```
+
+### Non-Existent Table Error Handling
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:39-45
+test("DescribeTable - Non-existent", async () => {
+  await executeAgainstBoth((client) =>
+    client.send(new DescribeTableCommand({
+      TableName: `non-existent-${randomUUID()}`,
+    }))
+  );
+});
+```
+
+### Pagination Tests
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:53-95
+test("ListTables - Pagination with Limit", async () => {
+  await executeAgainstBoth(async (client) => {
+    const tableA = `test-list-table-${randomUUID()}`;
+    const tableB = `test-list-table-${randomUUID()}`;
+
+    await client.send(new CreateTableCommand({
+      TableName: tableA,
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }));
+    await client.send(new CreateTableCommand({
+      TableName: tableB,
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }));
+
+    const res1 = await client.send(new ListTablesCommand({ Limit: 1 }));
+
+    let nextTablesResult;
+    if (res1.LastEvaluatedTableName) {
+      nextTablesResult = await client.send(new ListTablesCommand({
+        Limit: 1,
+        ExclusiveStartTableName: res1.LastEvaluatedTableName
+      }));
+    }
+
+    // Clean up
+    await client.send(new DeleteTableCommand({ TableName: tableA }));
+    await client.send(new DeleteTableCommand({ TableName: tableB }));
+
+    return {
+      res1NamesLength: res1.TableNames?.length,
+      res1HasLastEval: !!res1.LastEvaluatedTableName,
+      res2NamesLength: nextTablesResult?.TableNames?.length,
+    };
+  });
+});
+```
+
+### Validation Tests
+
+```typescript
+// From compat-test/src/tests/table.spec.ts:113-122
+test("CreateTable - Invalid KeySchema", async () => {
+  await executeAgainstBoth((client) =>
+    client.send(new CreateTableCommand({
+      TableName: `invalid-${randomUUID()}`,
+      KeySchema: [],
+      AttributeDefinitions: [],
+      BillingMode: "PAY_PER_REQUEST",
+    }))
+  );
+});
+```
+
+## Item CRUD Tests
+
+### PutItem Tests
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:24-33
+it("PutItem - Basic String", async () => {
+  const cmd = new PutItemCommand({
+    TableName: tableName,
+    Item: {
+      pk: { S: "item1" },
+      name: { S: "shivam" }
+    }
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+```
+
+### All Data Types Test
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:55-82
+it("PutItem - All Core Data Types", async () => {
+  const cmd = new PutItemCommand({
+    TableName: tableName,
+    Item: {
+      pk: { S: "item-types" },
+      str: { S: "hello" },
+      num: { N: "42.5" },
+      bin: { B: new Uint8Array([1, 2, 3]) },
+      boolTrue: { BOOL: true },
+      boolFalse: { BOOL: false },
+      nullVal: { NULL: true },
+      listVal: { L: [{ S: "a" }, { N: "1" }] },
+      mapVal: { M: { key1: { S: "val1" } } },
+      strSet: { SS: ["a", "b", "c"] },
+      numSet: { NS: ["1.1", "2.2", "3.3"] },
+      binSet: { BS: [new Uint8Array([1]), new Uint8Array([2])] }
+    }
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+
+  const getCmd = new GetItemCommand({
+    TableName: tableName,
+    Key: {
+      pk: { S: "item-types" }
+    }
+  });
+  await executeAgainstBoth(client => client.send(getCmd));
+});
+```
+
+### GetItem Tests
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:35-53
+it("GetItem - Basic String", async () => {
+  const cmd = new GetItemCommand({
+    TableName: tableName,
+    Key: {
+      pk: { S: "item1" }
+    }
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+
+it("GetItem - Non-existent Item", async () => {
+  const cmd = new GetItemCommand({
+    TableName: tableName,
+    Key: {
+      pk: { S: "does_not_exist" }
+    }
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+```
+
+### UpdateItem Tests
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:104-126
+it("UpdateItem - SET and REMOVE", async () => {
+  // First put an item
+  await executeAgainstBoth(client => client.send(new PutItemCommand({
+    TableName: tableName,
+    Item: {
+      pk: { S: "item-update" },
+      toUpdate: { S: "oldValue" },
+      toRemove: { N: "42" }
+    }
+  })));
+
+  // Then update it
+  const cmd = new UpdateItemCommand({
+    TableName: tableName,
+    Key: { pk: { S: "item-update" } },
+    UpdateExpression: "SET toUpdate = :newVal REMOVE toRemove",
+    ExpressionAttributeValues: {
+      ":newVal": { S: "newValue" }
+    },
+    ReturnValues: "ALL_NEW"
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+```
+
+### Conditional Operation Tests
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:128-142
+it("UpdateItem - Conditional failure (attribute_not_exists)", async () => {
+  await executeAgainstBoth(client => client.send(new PutItemCommand({
+    TableName: tableName,
+    Item: { pk: { S: "item-cond" }, exists: { BOOL: true } }
+  })));
+
+  const cmd = new UpdateItemCommand({
+    TableName: tableName,
+    Key: { pk: { S: "item-cond" } },
+    UpdateExpression: "SET newVal = :v",
+    ConditionExpression: "attribute_not_exists(exists)",
+    ExpressionAttributeValues: { ":v": { S: "1" } }
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+```
+
+<Warning>
+This test expects both implementations to throw `ConditionalCheckFailedException` with identical error messages.
+</Warning>
+
+### DeleteItem with ReturnValues
+
+```typescript
+// From compat-test/src/tests/crud.spec.ts:144-156
+it("DeleteItem - ReturnValues ALL_OLD", async () => {
+  await executeAgainstBoth(client => client.send(new PutItemCommand({
+    TableName: tableName,
+    Item: { pk: { S: "item-delete-vals" }, data: { S: "to-be-deleted" } }
+  })));
+
+  const cmd = new DeleteItemCommand({
+    TableName: tableName,
+    Key: { pk: { S: "item-delete-vals" } },
+    ReturnValues: "ALL_OLD"
+  });
+  await executeAgainstBoth(client => client.send(cmd));
+});
+```
+
+## Running the Tests
+
+<Steps>
+  <Step title="Install dependencies">
+    ```bash
+    cd compat-test
+    npm install
+    ```
+  </Step>
+  
+  <Step title="Start DynamoDB Local">
+    ```bash
+    docker run -p 8000:8000 amazon/dynamodb-local
+    ```
+  </Step>
+  
+  <Step title="Start shvm-db">
+    ```bash
+    npm run dev
+    ```
+  </Step>
+  
+  <Step title="Run tests">
+    ```bash
+    cd compat-test
+    npm test
+    ```
+  </Step>
+</Steps>
+
+## Response Normalization
+
+The comparator normalizes responses before comparison to handle acceptable differences:
+
+```typescript
+// From compat-test/src/diff/normalizer.ts
+// Normalizes timestamps, ARNs, and other non-deterministic fields
+```
+
+This ensures that:
+- Timestamps are compared with tolerance
+- ARNs are validated for structure, not exact values
+- Non-essential metadata differences don't cause test failures
+
+## Error Comparison
+
+Error messages and types must match exactly:
+
+```typescript
+// From compat-test/src/diff/comparator.ts
+export function compareError(oracleError: any, testError: any) {
+  if (!oracleError && !testError) return;
+  
+  if (oracleError && !testError) {
+    throw new Error(`Oracle errored but test succeeded: ${oracleError.message}`);
+  }
+  
+  if (!oracleError && testError) {
+    throw new Error(`Test errored but oracle succeeded: ${testError.message}`);
+  }
+  
+  // Compare error types and messages
+  expect(testError.name).toBe(oracleError.name);
+  expect(testError.message).toBe(oracleError.message);
+}
+```
+
+## Test Coverage
+
+Current test coverage includes:
+
+| Category | Operations Tested |
+|----------|-------------------|
+| **Table APIs** | CreateTable, DeleteTable, DescribeTable, ListTables |
+| **Item APIs** | PutItem, GetItem, UpdateItem, DeleteItem |
+| **Data Types** | S, N, B, BOOL, NULL, L, M, SS, NS, BS |
+| **Expressions** | ConditionExpression, UpdateExpression (SET, REMOVE) |
+| **Edge Cases** | Non-existent items, duplicate tables, empty key schemas |
+| **ReturnValues** | ALL_OLD, ALL_NEW |
+| **Pagination** | Limit, ExclusiveStartTableName |
+
+## Continuous Integration
+
+The test suite runs on every commit to ensure:
+
+1. **No regressions**: Existing functionality remains compatible
+2. **New features match DynamoDB**: New operations behave identically to AWS
+3. **Error handling is consistent**: Edge cases produce the same errors
+
+## Writing New Tests
+
+To add a new test:
+
+<Steps>
+  <Step title="Create a test file">
+    Add a new `.spec.ts` file in `compat-test/src/tests/`.
+  </Step>
+  
+  <Step title="Use executeAgainstBoth">
+    Wrap your commands in `executeAgainstBoth` to run against both implementations.
+  </Step>
+  
+  <Step title="Use real AWS SDK commands">
+    Import from `@aws-sdk/client-dynamodb` for full type safety.
+  </Step>
+  
+  <Step title="Test both success and failure paths">
+    Include tests for valid operations AND expected errors.
+  </Step>
+  
+  <Step title="Clean up resources">
+    Delete test tables in `afterAll` hooks to avoid pollution.
+  </Step>
+</Steps>
+
+### Example Test
+
+```typescript
+import { describe, it, beforeAll, afterAll } from "vitest";
+import { CreateTableCommand, DeleteTableCommand, PutItemCommand } from "@aws-sdk/client-dynamodb";
+import { executeAgainstBoth } from "../testHarness";
+
+describe("My New Feature", () => {
+  const tableName = `test-feature-${crypto.randomUUID()}`;
+
+  beforeAll(async () => {
+    await executeAgainstBoth(client => client.send(new CreateTableCommand({
+      TableName: tableName,
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST"
+    })));
+  });
+
+  afterAll(async () => {
+    await executeAgainstBoth(client => client.send(new DeleteTableCommand({
+      TableName: tableName
+    })));
+  });
+
+  it("should do something", async () => {
+    await executeAgainstBoth(client => client.send(new PutItemCommand({
+      TableName: tableName,
+      Item: { pk: { S: "test" } }
+    })));
+  });
+});
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Test against real DynamoDB Local">
+    Never mock the oracle—test against the actual implementation.
+  </Step>
+  
+  <Step title="Use random table names">
+    Avoid test pollution by generating unique table names.
+  </Step>
+  
+  <Step title="Test error paths explicitly">
+    Don't just test happy paths—validate error behavior.
+  </Step>
+  
+  <Step title="Keep tests isolated">
+    Each test should create and clean up its own resources.
+  </Step>
+  
+  <Step title="Document expected behavior">
+    Use comments to explain why certain errors are expected.
+  </Step>
+</Steps>
+
+## Related Topics
+
+- [Table Management](/guides/table-management) - Tested table operations
+- [Working with Items](/guides/working-with-items) - Tested item operations
+- [Caching Strategy](/guides/caching-strategy) - Cache behavior testing considerations

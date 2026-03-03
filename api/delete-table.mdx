@@ -1,0 +1,138 @@
+---
+title: DeleteTable
+description: Delete an existing DynamoDB table and all of its data
+---
+
+Deletes the specified table and all of its items. The table is marked as `DELETING` and then removed from storage.
+
+## Request
+
+### Endpoint
+
+```bash
+POST /
+```
+
+### Headers
+
+```bash
+Content-Type: application/x-amz-json-1.0
+x-amz-target: DynamoDB_20120810.DeleteTable
+```
+
+### Request Body
+
+<ParamField path="TableName" type="string" required>
+  Name of the table to delete.
+</ParamField>
+
+## Response
+
+<ResponseField name="TableDescription" type="object">
+  Description of the table that was deleted, showing its state before deletion.
+  
+  <Expandable title="properties">
+    <ResponseField name="TableName" type="string">
+      Name of the deleted table.
+    </ResponseField>
+    
+    <ResponseField name="KeySchema" type="array">
+      Key schema elements of the deleted table.
+    </ResponseField>
+    
+    <ResponseField name="AttributeDefinitions" type="array">
+      Attribute definitions of the deleted table.
+    </ResponseField>
+    
+    <ResponseField name="TableStatus" type="string">
+      Status of the table. Will be the original status (typically `ACTIVE`) before deletion.
+    </ResponseField>
+    
+    <ResponseField name="CreationDateTime" type="number">
+      Unix timestamp (in seconds) when the table was originally created.
+    </ResponseField>
+    
+    <ResponseField name="TableArn" type="string">
+      Amazon Resource Name (ARN) of the deleted table.
+    </ResponseField>
+    
+    <ResponseField name="ItemCount" type="number">
+      Number of items that were in the table before deletion.
+    </ResponseField>
+    
+    <ResponseField name="TableSizeBytes" type="number">
+      Size of the table in bytes before deletion.
+    </ResponseField>
+    
+    <ResponseField name="DeletionProtectionEnabled" type="boolean">
+      Whether deletion protection was enabled.
+    </ResponseField>
+    
+    <ResponseField name="ProvisionedThroughput" type="object">
+      Provisioned throughput settings of the deleted table.
+    </ResponseField>
+    
+    <ResponseField name="BillingModeSummary" type="object">
+      Billing mode details of the deleted table, if applicable.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.DeleteTable" \
+  -d '{
+    "TableName": "Users"
+  }'
+```
+
+### Response
+
+```json
+{
+  "TableDescription": {
+    "TableName": "Users",
+    "KeySchema": [
+      {
+        "AttributeName": "userId",
+        "KeyType": "HASH"
+      }
+    ],
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "userId",
+        "AttributeType": "S"
+      }
+    ],
+    "TableStatus": "ACTIVE",
+    "CreationDateTime": 1709481600.123,
+    "ItemCount": 42,
+    "TableSizeBytes": 8192,
+    "TableArn": "arn:aws:dynamodb:ddblocal:000000000000:table/Users",
+    "DeletionProtectionEnabled": false,
+    "BillingModeSummary": {
+      "BillingMode": "PAY_PER_REQUEST",
+      "LastUpdateToPayPerRequestDateTime": 1709481600.123
+    }
+  }
+}
+```
+
+## Errors
+
+<ResponseField name="ResourceNotFoundException" type="error">
+  **Status Code:** 400
+  
+  Returned when the specified table does not exist.
+  
+  **Message:** "Cannot do operations on a non-existent table"
+</ResponseField>
+
+<ResponseField name="InternalServerError" type="error">
+  **Status Code:** 500
+  
+  Returned when an unexpected server error occurs.
+</ResponseField>

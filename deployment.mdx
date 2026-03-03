@@ -1,0 +1,540 @@
+---
+title: Deployment
+description: Deploy shvm-db to Cloudflare Workers and configure production settings
+---
+
+Deploy shvm-db to Cloudflare Workers with global edge distribution, automatic scaling, and Durable Objects for per-partition consistency.
+
+## Prerequisites
+
+Before deploying, ensure you have:
+
+- Completed [installation](/installation)
+- A Cloudflare account ([sign up here](https://dash.cloudflare.com/sign-up))
+- Cloudflare Workers paid plan (required for Durable Objects)
+- Wrangler CLI authenticated
+
+## Authentication
+
+<Steps>
+  <Step title="Login to Cloudflare">
+    ```bash
+    npx wrangler login
+    ```
+
+    This opens a browser window to authenticate with your Cloudflare account.
+  </Step>
+
+  <Step title="Verify authentication">
+    ```bash
+    npx wrangler whoami
+    ```
+
+    Expected output:
+    ```
+    👋 You are logged in as <your-email@example.com>
+    Account Name: <Your Account>
+    Account ID: <account-id>
+    ```
+  </Step>
+</Steps>
+
+## Deployment Methods
+
+<Tabs>
+  <Tab title="Quick Deploy">
+    ### One-Command Deployment
+
+    Deploy to Cloudflare Workers with a single command:
+
+    ```bash
+    npm run deploy
+    ```
+
+    This runs `wrangler deploy` and:
+    1. Builds the TypeScript project
+    2. Uploads the worker to Cloudflare
+    3. Configures Durable Objects bindings
+    4. Applies migrations
+    5. Returns the deployed URL
+
+    Output:
+    ```
+    ⛅️ wrangler 4.51.0
+    -------------------
+    Total Upload: 150.23 KiB / gzip: 45.67 KiB
+    Uploaded shvm-db (2.34 sec)
+    Published shvm-db (0.45 sec)
+      https://shvm-db.<your-subdomain>.workers.dev
+    Current Deployment ID: <deployment-id>
+    ```
+  </Tab>
+
+  <Tab title="Production Deploy">
+    ### Deploy with Custom Configuration
+
+    For production deployments with custom settings:
+
+    ```bash
+    npm run deploy:live
+    ```
+
+    This runs:
+    ```bash
+    wrangler deploy && echo 'Live deployment active. Update your client config to point to the deployed URL.'
+    ```
+
+    <Warning>
+      Remember to update your client configuration to use the deployed URL instead of `localhost:8787`.
+    </Warning>
+  </Tab>
+
+  <Tab title="One-Click Deploy">
+    ### Deploy from GitHub
+
+    Use the one-click deployment button:
+
+    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/shivamd20/shvm-db)
+
+    This automatically:
+    - Forks the repository
+    - Configures Workers and Durable Objects
+    - Deploys to your Cloudflare account
+    - Sets up CI/CD with GitHub Actions
+  </Tab>
+</Tabs>
+
+## Configuration
+
+### Wrangler Configuration
+
+The deployment uses `wrangler.jsonc` configuration:
+
+```json
+{
+  "name": "shvm-db",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-28",
+  "placement": {
+    "mode": "smart"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PARTITION_DO",
+        "class_name": "PartitionDO"
+      },
+      {
+        "name": "TABLE_REGISTRY_DO",
+        "class_name": "TableRegistryDO"
+      },
+      {
+        "name": "TRACE_DO",
+        "class_name": "TraceDO"
+      }
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true
+    }
+  }
+}
+```
+
+### Smart Placement
+
+shvm-db uses Cloudflare's **Smart Placement** feature:
+
+```json
+{
+  "placement": {
+    "mode": "smart"
+  }
+}
+```
+
+This automatically places your worker close to:
+- Durable Objects instances
+- End users making requests
+- Reduces latency by minimizing network hops
+
+### Environment Variables
+
+<Tabs>
+  <Tab title="Production">
+    Production environment variables in `wrangler.jsonc`:
+
+    ```json
+    {
+      "env": {
+        "production": {
+          "vars": {
+            "SHVM_DEBUG": "false"
+          }
+        }
+      }
+    }
+    ```
+
+    Deploy to production:
+    ```bash
+    wrangler deploy --env production
+    ```
+  </Tab>
+
+  <Tab title="Debug Mode">
+    Enable debug logging for troubleshooting:
+
+    ```json
+    {
+      "vars": {
+        "SHVM_DEBUG": "true"
+      }
+    }
+    ```
+
+    Deploy with debug enabled:
+    ```bash
+    wrangler deploy
+    ```
+  </Tab>
+</Tabs>
+
+### Custom Domain
+
+Configure a custom domain in `wrangler.jsonc`:
+
+```json
+{
+  "routes": [
+    {
+      "pattern": "db.yourdomain.com",
+      "custom_domain": true
+    }
+  ]
+}
+```
+
+Deploy with custom domain:
+```bash
+npm run deploy
+```
+
+Cloudflare automatically provisions SSL certificates for custom domains.
+
+## Durable Objects Setup
+
+### Bindings
+
+shvm-db requires three Durable Objects bindings:
+
+| Binding | Class | Purpose |
+|---------|-------|----------|
+| `PARTITION_DO` | `PartitionDO` | Per-partition storage with SQLite |
+| `TABLE_REGISTRY_DO` | `TableRegistryDO` | Global table metadata registry |
+| `TRACE_DO` | `TraceDO` | Request tracing and observability |
+
+These are automatically configured during deployment.
+
+### Migrations
+
+Durable Objects migrations are defined in `wrangler.jsonc`:
+
+```json
+{
+  "migrations": [
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "PartitionDO",
+        "TableRegistryDO"
+      ]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "TraceDO"
+      ]
+    },
+    {
+      "tag": "v5",
+      "deleted_classes": [
+        "SubDO"
+      ]
+    }
+  ]
+}
+```
+
+Migrations run automatically on deployment and ensure:
+- Existing Durable Objects instances are preserved
+- New classes are registered
+- Deprecated classes are safely removed
+
+## Observability
+
+### Logs
+
+View real-time logs:
+
+```bash
+npx wrangler tail
+```
+
+Filter by log level:
+```bash
+npx wrangler tail --format pretty
+```
+
+### Traces
+
+shvm-db includes built-in request tracing. Query traces via the API:
+
+```bash
+curl https://<your-worker>.workers.dev/api/trace?requestId=<request-id>
+```
+
+Response:
+```json
+{
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "events": [
+    {
+      "step": "worker_routing",
+      "startMs": 0,
+      "durationMs": 1.2
+    },
+    {
+      "step": "get_table_metadata",
+      "startMs": 1.2,
+      "durationMs": 3.5,
+      "attributes": {
+        "metadata_source": "cache"
+      }
+    },
+    {
+      "step": "do_get_item",
+      "startMs": 4.7,
+      "durationMs": 5.3
+    }
+  ]
+}
+```
+
+### Invocation Logs
+
+View invocation logs in the Cloudflare dashboard:
+
+1. Go to **Workers & Pages** → **shvm-db**
+2. Click **Logs** tab
+3. Enable **Invocation logs**
+
+## Performance Optimization
+
+### Caching Strategy
+
+shvm-db uses Cloudflare's Cache API:
+
+| Cache Type | TTL | Purpose |
+|------------|-----|----------|
+| Item cache | 5 minutes | GetItem responses |
+| Table metadata | 2 hours | Table schemas |
+
+Cache configuration in `src/cache.ts`:
+
+```typescript
+// Item cache
+await cacheManager.putItem(ctx, "item", doKey, item, 300); // 5 min
+
+// Table metadata cache
+await cacheManager.putItem(ctx, "table", tableName, metadata, 7200); // 2 hours
+```
+
+### Write-Through Cache
+
+Writes invalidate cache automatically:
+
+```typescript
+// PutItem: write-through cache
+await pStub.handlePutItem(...);
+await cacheManager.putItem(ctx, "item", doKey, body.Item, 300);
+
+// DeleteItem: cache invalidation
+await pStub.handleDeleteItem(...);
+await cacheManager.deleteItem(ctx, "item", doKey, 300);
+```
+
+## Monitoring
+
+### Request Headers
+
+Every response includes debugging headers:
+
+```http
+X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
+X-SHIVAM-DB-OP: GetItem
+X-SHIVAM-DB-TABLE: Users
+X-SHIVAM-DB-PARTITION-ID-INTERNAL: 42
+X-SHIVAM-DB-PARTITION-KEY: Users::partition-42
+X-SHIVAM-DB-Trace-Summary: total_ms=8.5,cache_read_ms=1.2,do_get_item_ms=5.3
+```
+
+### Metrics
+
+Key metrics to monitor:
+
+- **Per-partition QPS**: Requests per second to each PartitionDO
+- **Cache hit rate**: Percentage of cache hits vs. misses
+- **DO invocation time**: Time spent in Durable Objects
+- **SQLite latency**: Database operation latency
+
+## Cost Estimation
+
+### Cloudflare Workers Pricing
+
+shvm-db costs are based on:
+
+| Component | Pricing |
+|-----------|----------|
+| Worker requests | $0.50 per million requests |
+| Durable Objects compute | $12.50 per million requests |
+| Durable Objects storage | $0.20 per GB-month |
+
+### Cost Optimization
+
+<AccordionGroup>
+  <Accordion title="Use edge caching">
+    The built-in Cache API reduces Durable Objects invocations:
+    - **5-minute item cache**: ~80-90% cache hit rate for read-heavy workloads
+    - **2-hour table metadata cache**: Near 100% hit rate after warm-up
+
+    Cache hits bypass Durable Objects entirely, reducing compute costs.
+  </Accordion>
+
+  <Accordion title="Optimize partition distribution">
+    Configure `NUM_PARTITIONS` to balance:
+    - **More partitions**: Better parallelism, higher storage overhead
+    - **Fewer partitions**: Lower overhead, potential hot partitions
+
+    Default: `100` partitions
+
+    Update in `wrangler.jsonc`:
+    ```json
+    {
+      "vars": {
+        "NUM_PARTITIONS": 100
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Monitor hot partitions">
+    Hot partitions (high QPS to same partition key) are expensive due to:
+    - Serialized execution in single Durable Object
+    - CPU-bound operations
+
+    Mitigate with:
+    - Better partition key design
+    - Edge caching for read-heavy keys
+  </Accordion>
+</AccordionGroup>
+
+## Rollback
+
+Rollback to a previous deployment:
+
+<Steps>
+  <Step title="List deployments">
+    ```bash
+    npx wrangler deployments list
+    ```
+
+    Output:
+    ```
+    Deployment ID | Created             | Source
+    abc123def456  | 2026-03-03 10:30:00 | Upload
+    xyz789ghi012  | 2026-03-02 15:20:00 | Upload
+    ```
+  </Step>
+
+  <Step title="Rollback to deployment">
+    ```bash
+    npx wrangler rollback --deployment-id xyz789ghi012
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Durable Objects storage is not rolled back. Only the worker code is reverted.
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment fails: Durable Objects quota exceeded">
+    You've hit the Durable Objects limit on your plan.
+
+    **Solution**: Upgrade to Workers Paid plan:
+    ```bash
+    # Visit Cloudflare dashboard
+    # Workers & Pages → Plans → Upgrade to Paid
+    ```
+  </Accordion>
+
+  <Accordion title="Error: Migration tag already exists">
+    The migration tag has already been applied.
+
+    **Solution**: Increment the migration tag in `wrangler.jsonc`:
+    ```json
+    {
+      "migrations": [
+        {
+          "tag": "v6",  // Increment version
+          "new_sqlite_classes": [...]
+        }
+      ]
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Custom domain not working">
+    DNS records may not be configured.
+
+    **Solution**: Check Cloudflare DNS settings:
+    1. Go to **DNS** in Cloudflare dashboard
+    2. Ensure CNAME record points to your worker
+    3. Wait up to 5 minutes for propagation
+  </Accordion>
+
+  <Accordion title="High latency after deployment">
+    Durable Objects may be cold-starting.
+
+    **Solution**:
+    - Wait 5-10 minutes for warm-up
+    - Send a few warmup requests
+    - Enable Smart Placement (already enabled by default)
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="code" href="/api/create-table">
+    Explore all available operations
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Deep dive into the system design
+  </Card>
+  <Card title="Benchmarking" icon="chart-line" href="/operations/benchmarking">
+    Run performance benchmarks
+  </Card>
+  <Card title="Observability" icon="chart-mixed" href="/operations/monitoring">
+    Monitor and debug your deployment
+  </Card>
+</CardGroup>

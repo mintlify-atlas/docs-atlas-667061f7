@@ -1,0 +1,310 @@
+---
+title: Update Expressions
+description: Update expression syntax for modifying items in shvm-db
+---
+
+## Overview
+
+Update expressions define how to modify attributes of an existing item. They allow you to update specific attributes without replacing the entire item.
+
+## Supported Actions
+
+shvm-db supports two update actions:
+
+### SET - Set Attribute Values
+
+The `SET` action updates or creates attributes.
+
+**Syntax:**
+```
+SET attribute = value [, attribute = value, ...]
+```
+
+**Example:**
+```javascript
+{
+  TableName: "users",
+  Key: { userId: { S: "user123" } },
+  UpdateExpression: "SET #name = :newName, #email = :newEmail",
+  ExpressionAttributeNames: {
+    "#name": "name",
+    "#email": "email"
+  },
+  ExpressionAttributeValues: {
+    ":newName": { S: "Alice Smith" },
+    ":newEmail": { S: "alice@example.com" }
+  }
+}
+```
+
+### REMOVE - Delete Attributes
+
+The `REMOVE` action deletes attributes from an item.
+
+**Syntax:**
+```
+REMOVE attribute [, attribute, ...]
+```
+
+**Example:**
+```javascript
+{
+  TableName: "users",
+  Key: { userId: { S: "user123" } },
+  UpdateExpression: "REMOVE #tempField, #deprecated",
+  ExpressionAttributeNames: {
+    "#tempField": "temporaryField",
+    "#deprecated": "deprecatedAttribute"
+  }
+}
+```
+
+## Combining Actions
+
+You can combine `SET` and `REMOVE` in a single update expression:
+
+```javascript
+{
+  TableName: "products",
+  Key: { productId: { S: "prod-456" } },
+  UpdateExpression: "SET #price = :newPrice, #updated = :timestamp REMOVE #discount",
+  ExpressionAttributeNames: {
+    "#price": "price",
+    "#updated": "lastUpdated",
+    "#discount": "discountPercent"
+  },
+  ExpressionAttributeValues: {
+    ":newPrice": { N: "29.99" },
+    ":timestamp": { N: "1709481600000" }
+  }
+}
+```
+
+## Expression Attribute Names
+
+Use expression attribute names to:
+- Reference attributes that are reserved keywords
+- Handle attributes with special characters or spaces
+- Improve code readability
+
+```javascript
+{
+  UpdateExpression: "SET #s = :val",
+  ExpressionAttributeNames: {
+    "#s": "status"  // "status" might be a reserved word
+  },
+  ExpressionAttributeValues: {
+    ":val": { S: "active" }
+  }
+}
+```
+
+## Expression Attribute Values
+
+All values in `SET` actions must be provided via `ExpressionAttributeValues`:
+
+```javascript
+{
+  UpdateExpression: "SET #count = :newCount, #flag = :enabled",
+  ExpressionAttributeValues: {
+    ":newCount": { N: "42" },
+    ":enabled": { BOOL: true }
+  }
+}
+```
+
+## Evaluation Logic
+
+Update expressions are evaluated in `src/dynamo-ast.ts:36-58`:
+
+1. **Parse SET clause**: Extracts attribute-value pairs from `SET` section
+2. **Map attributes**: Resolves expression attribute names to actual attribute names
+3. **Apply values**: Sets each attribute to its corresponding value from `ExpressionAttributeValues`
+4. **Parse REMOVE clause**: Extracts attributes to remove
+5. **Delete attributes**: Removes specified attributes from the item
+
+The evaluator modifies the item in-place:
+
+```typescript
+// SET processing
+const setMatch = updateExpression.match(/SET\s+([^R]+)/);
+if (setMatch) {
+  const parts = setMatch[1].split(',');
+  for (const p of parts) {
+    const [attr, valVar] = p.split('=').map(s => s.trim());
+    const realAttr = names?.[attr] || attr;
+    if (values && values[valVar]) {
+      currentItem[realAttr] = values[valVar];
+    }
+  }
+}
+
+// REMOVE processing
+const removeMatch = updateExpression.match(/REMOVE\s+(.+)/);
+if (removeMatch) {
+  const parts = removeMatch[1].split(',');
+  for (let attr of parts) {
+    attr = attr.trim();
+    const realAttr = names?.[attr] || attr;
+    delete currentItem[realAttr];
+  }
+}
+```
+
+## Return Values
+
+Control what the UpdateItem operation returns using `ReturnValues`:
+
+- `NONE`: Returns nothing (default)
+- `ALL_OLD`: Returns the item as it was before the update
+- `ALL_NEW`: Returns the item as it is after the update
+- `UPDATED_OLD`: Returns only updated attributes before the update
+- `UPDATED_NEW`: Returns only updated attributes after the update
+
+```javascript
+{
+  TableName: "counters",
+  Key: { counterId: { S: "pageviews" } },
+  UpdateExpression: "SET #count = :newValue",
+  ExpressionAttributeNames: {
+    "#count": "count"
+  },
+  ExpressionAttributeValues: {
+    ":newValue": { N: "1000" }
+  },
+  ReturnValues: "ALL_NEW"
+}
+```
+
+Response:
+```json
+{
+  "Attributes": {
+    "counterId": { "S": "pageviews" },
+    "count": { "N": "1000" },
+    "lastUpdated": { "N": "1709481600000" }
+  }
+}
+```
+
+## Examples
+
+### Update Single Attribute
+
+```javascript
+const params = {
+  TableName: "users",
+  Key: { userId: { S: "user-123" } },
+  UpdateExpression: "SET #email = :email",
+  ExpressionAttributeNames: {
+    "#email": "email"
+  },
+  ExpressionAttributeValues: {
+    ":email": { S: "newemail@example.com" }
+  },
+  ReturnValues: "ALL_NEW"
+};
+
+const result = await dynamoClient.send(new UpdateItemCommand(params));
+console.log(result.Attributes);
+```
+
+### Update Multiple Attributes
+
+```javascript
+const params = {
+  TableName: "orders",
+  Key: { orderId: { S: "order-456" } },
+  UpdateExpression: "SET #status = :status, #updated = :timestamp, #notes = :notes",
+  ExpressionAttributeNames: {
+    "#status": "status",
+    "#updated": "updatedAt",
+    "#notes": "processingNotes"
+  },
+  ExpressionAttributeValues: {
+    ":status": { S: "shipped" },
+    ":timestamp": { N: "1709481600000" },
+    ":notes": { S: "Shipped via FedEx" }
+  }
+};
+
+await dynamoClient.send(new UpdateItemCommand(params));
+```
+
+### Remove Attributes
+
+```javascript
+const params = {
+  TableName: "sessions",
+  Key: { sessionId: { S: "sess-789" } },
+  UpdateExpression: "REMOVE #temp, #cache",
+  ExpressionAttributeNames: {
+    "#temp": "temporaryData",
+    "#cache": "cachedResults"
+  }
+};
+
+await dynamoClient.send(new UpdateItemCommand(params));
+```
+
+### SET and REMOVE Combined
+
+```javascript
+const params = {
+  TableName: "profiles",
+  Key: { profileId: { S: "profile-999" } },
+  UpdateExpression: "SET #verified = :true, #verifiedAt = :now REMOVE #pendingToken",
+  ExpressionAttributeNames: {
+    "#verified": "emailVerified",
+    "#verifiedAt": "verifiedAt",
+    "#pendingToken": "verificationToken"
+  },
+  ExpressionAttributeValues: {
+    ":true": { BOOL: true },
+    ":now": { N: "1709481600000" }
+  },
+  ReturnValues: "ALL_NEW"
+};
+
+const result = await dynamoClient.send(new UpdateItemCommand(params));
+```
+
+### Conditional Update
+
+Combine update expressions with condition expressions:
+
+```javascript
+const params = {
+  TableName: "inventory",
+  Key: { sku: { S: "SKU-001" } },
+  UpdateExpression: "SET #qty = :newQty",
+  ConditionExpression: "#qty = :expectedQty",
+  ExpressionAttributeNames: {
+    "#qty": "quantity"
+  },
+  ExpressionAttributeValues: {
+    ":newQty": { N: "95" },
+    ":expectedQty": { N: "100" }  // Only update if current quantity is 100
+  }
+};
+
+try {
+  await dynamoClient.send(new UpdateItemCommand(params));
+} catch (err) {
+  if (err.name === 'ConditionalCheckFailedException') {
+    console.log('Quantity has changed, retry operation');
+  }
+}
+```
+
+## Cache Behavior
+
+When using `ReturnValues: "ALL_NEW"`, shvm-db automatically updates the edge cache with the new item state (see `src/index.ts:291-295`). For other return values, the cache is invalidated to ensure consistency.
+
+## Implementation Reference
+
+Update expression evaluation is implemented in `src/dynamo-ast.ts:36-58`. The implementation handles:
+- Parsing `SET` and `REMOVE` clauses
+- Mapping expression attribute names
+- Resolving expression attribute values
+- Modifying the item in-place

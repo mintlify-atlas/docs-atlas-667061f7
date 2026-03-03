@@ -1,0 +1,274 @@
+---
+title: Data Model
+description: Table and item structure, SQLite schema, and key design in shvm-db
+---
+
+## DynamoDB Data Model
+
+shvm-db implements the same data model as DynamoDB to provide API compatibility.
+
+### Table Definition
+
+Every table has:
+
+- **Partition Key (PK)**: Required, determines data distribution
+- **Sort Key (SK)**: Optional, enables range queries within partition
+- **Attribute Definitions**: Schema for key attributes
+- **Key Schema**: Specifies which attributes are HASH and RANGE keys
+
+### Item Structure
+
+Items are stored as JSON documents with DynamoDB-style attribute values:
+
+```json
+{
+  "UserId": { "S": "user123" },
+  "Timestamp": { "N": "1234567890" },
+  "Status": { "S": "active" },
+  "Metadata": {
+    "M": {
+      "LastLogin": { "N": "1234567890" },
+      "LoginCount": { "N": "42" }
+    }
+  }
+}
+```
+
+### Attribute Value Types
+
+Supported DynamoDB types:
+
+- **S**: String
+- **N**: Number (stored as string, parsed as needed)
+- **B**: Binary (base64-encoded)
+- **BOOL**: Boolean
+- **NULL**: Null value
+- **M**: Map (nested object)
+- **L**: List (array)
+- **SS**: String Set
+- **NS**: Number Set
+- **BS**: Binary Set
+
+## SQLite Schema
+
+### PartitionDO Schema (v3)
+
+Each PartitionDO contains a single SQLite database with this schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS items_v3 (
+    id TEXT PRIMARY KEY,
+    version INTEGER,
+    value BLOB,
+    deleted INTEGER DEFAULT 0
+);
+```
+
+#### Schema Fields
+
+| Field | Type | Purpose |
+|-------|------|--------|
+| `id` | TEXT | Concatenated key: `{pk}#{sk}` (primary key) |
+| `version` | INTEGER | Reserved for future optimistic concurrency control |
+| `value` | BLOB | JSON-serialized item (full DynamoDB attribute map) |
+| `deleted` | INTEGER | Tombstone flag (0 = active, 1 = deleted) |
+
+### Key Construction
+
+The `id` field is constructed as:
+
+```typescript
+// For tables WITH sort key
+const doKey = `${pkRaw}#${skRaw}`;
+
+// For tables WITHOUT sort key
+const doKey = `${pkRaw}#default`;
+```
+
+**Examples:**
+
+- User table with PK only: `user123#default`
+- Order table with PK + SK: `user123#order-2024-03-03`
+
+### Why This Schema?
+
+1. **Simple Primary Key**: Single TEXT field enables fast lookups
+2. **Flexible Storage**: BLOB value stores arbitrary JSON
+3. **Tombstone Support**: Soft deletes enable proper cache invalidation
+4. **Version Field**: Placeholder for future OCC (optimistic concurrency control)
+5. **No Secondary Indexes**: Keeps SQLite simple and fast
+
+## Table Registry Schema
+
+The TableRegistryDO stores table metadata in Durable Object key-value storage (not SQLite):
+
+```typescript
+interface TableMetadata {
+  TableName: string;
+  KeySchema: Array<{
+    AttributeName: string;
+    KeyType: "HASH" | "RANGE";
+  }>;
+  AttributeDefinitions: Array<{
+    AttributeName: string;
+    AttributeType: "S" | "N" | "B";
+  }>;
+  TableStatus: "ACTIVE" | "CREATING" | "DELETING";
+  CreationDateTime: number;
+  ItemCount: number;
+  TableSizeBytes: number;
+  TableArn: string;
+  DeletionProtectionEnabled: boolean;
+  ProvisionedThroughput?: {
+    ReadCapacityUnits: number;
+    WriteCapacityUnits: number;
+  };
+  BillingModeSummary?: {
+    BillingMode: "PAY_PER_REQUEST";
+    LastUpdateToPayPerRequestDateTime: number;
+  };
+}
+```
+
+### Storage Location
+
+```typescript
+// Stored in DO key-value storage
+await this.ctx.storage.put(tableName, metadata);
+
+// Retrieved by table name
+const metadata = await this.ctx.storage.get<TableMetadata>(tableName);
+```
+
+## SQLite Queries
+
+### Read Query
+
+```typescript
+// From src/sql/queries.ts
+GET_LATEST: "SELECT value, deleted FROM items_v3 WHERE id = ?"
+```
+
+**Execution:**
+
+```typescript
+const cursor = this.sql.exec(PartitionDOQueries.Items.GET_LATEST, doKey);
+const row = Array.from(cursor)[0];
+
+if (!row || row.deleted === 1) {
+  return null; // Item doesn't exist or was deleted
+}
+
+return JSON.parse(row.value); // Return parsed item
+```
+
+### Write Query
+
+```typescript
+// From src/sql/queries.ts
+INSERT: "INSERT OR REPLACE INTO items_v3 (id, version, value, deleted) VALUES (?, ?, ?, ?)"
+```
+
+**Execution:**
+
+```typescript
+// PutItem
+this.sql.exec(
+  PartitionDOQueries.Items.INSERT,
+  doKey,              // id
+  1,                  // version
+  JSON.stringify(value), // value (JSON string)
+  0                   // deleted (0 = active)
+);
+
+// DeleteItem (tombstone)
+this.sql.exec(
+  PartitionDOQueries.Items.INSERT,
+  doKey,
+  1,
+  null,               // value = null
+  1                   // deleted = 1
+);
+```
+
+## Data Lifecycle
+
+### Item Creation (PutItem)
+
+1. Validate item against table schema
+2. Construct composite key: `pk#sk`
+3. Serialize item to JSON
+4. Execute `INSERT OR REPLACE` in SQLite
+5. Update edge cache with new value
+
+### Item Read (GetItem)
+
+1. Check edge cache (5-minute TTL)
+2. On miss: Query SQLite by composite key
+3. Check `deleted` flag
+4. Parse JSON if item exists
+5. Update edge cache
+
+### Item Update (UpdateItem)
+
+1. Read current item from SQLite
+2. Evaluate condition expression (if provided)
+3. Apply updates (AttributeUpdates or UpdateExpression)
+4. Serialize updated item to JSON
+5. Execute `INSERT OR REPLACE` in SQLite
+6. Invalidate or update edge cache
+
+### Item Deletion (DeleteItem)
+
+1. Read current item (if returnValues requested)
+2. Evaluate condition expression (if provided)
+3. Execute `INSERT OR REPLACE` with `deleted=1`
+4. Write tombstone to edge cache (prevents resurrection)
+
+## Storage Characteristics
+
+### Per-Partition Storage
+
+- Each partition has independent SQLite file
+- Storage grows linearly with item count
+- No cross-partition storage overhead
+- No denormalization or duplication (MVP)
+
+### WAL Mode
+
+SQLite runs in Write-Ahead Logging mode:
+
+- Writers don't block readers
+- Better concurrency within DO's single thread
+- Automatic checkpoint management
+- Crash recovery via WAL replay
+
+### Storage Limits
+
+- Cloudflare DO storage: Effectively unlimited per DO
+- Practical limit: Keep partitions under 1GB for performance
+- No automatic partition splitting (MVP)
+
+## Schema Evolution
+
+The schema is versioned (`items_v3`) to allow future migrations:
+
+```typescript
+// From src/sql/migrations.ts
+export function runPartitionDOMigrations(sql: SqlStorage) {
+    sql.exec(PartitionDOQueries.Schema.CREATE_ITEMS);
+}
+```
+
+Migrations run on DO construction, ensuring schema exists before any operations.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Partitioning" icon="table-cells" href="/architecture/partitioning">
+    Learn how data is distributed across partitions
+  </Card>
+  <Card title="Durable Objects" icon="cube" href="/architecture/durable-objects">
+    Explore PartitionDO implementation details
+  </Card>
+</CardGroup>

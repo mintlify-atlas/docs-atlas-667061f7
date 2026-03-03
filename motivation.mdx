@@ -1,0 +1,146 @@
+---
+title: Motivation
+description: Why shvm-db exists and what you'll learn by using it
+---
+
+# Why shvm-db exists
+
+DynamoDB proves that a **simple API + brutal operational discipline** can scale to absurd throughput. What it hides, however, is *how* much of that power comes from partitioning, routing, and automation rather than any magical storage engine.
+
+**shvm-db exists to demystify DynamoDB by rebuilding its core model from first principles**, using modern serverless primitives.
+
+## The learning gap
+
+When you use DynamoDB in production, you interact with a black box:
+
+- Why do hot partitions throttle at exactly 1,000 WCU?
+- How does partition key hashing eliminate coordination overhead?
+- What's the actual cost of cross-partition queries?
+- Why can't you get strong consistency across partition keys?
+
+Books and documentation explain *what* happens, but not *why* it must be that way.
+
+shvm-db makes the invisible visible by rebuilding the architecture with transparent, measurable primitives.
+
+## Core architecture principles
+
+### 1. Cloudflare Durable Objects for single-writer partitions
+
+Each partition key maps deterministically to exactly one Durable Object. This gives you:
+
+- **Guaranteed single-writer semantics** without coordination
+- **Strong per-partition consistency** for free
+- **Observable throughput ceilings** that match DynamoDB's behavior
+
+<Info>
+  One Partition Key → SHA-256 Hash → One PartitionDO (Storage Executor)
+</Info>
+
+### 2. SQLite as the per-partition storage engine
+
+Instead of a proprietary storage engine, shvm-db uses SQLite in WAL mode:
+
+- **Predictable performance characteristics** you can measure
+- **Standard SQL tooling** for inspection and debugging
+- **Well-understood failure modes** and recovery semantics
+
+SQLite is the **only read/write path** inside the PartitionDO. There are no hidden queues, no background replication, no eventual consistency surprises.
+
+### 3. A unified global Table Registry
+
+The `TableRegistryDO` is a single global Durable Object that stores metadata for all tables:
+
+- Ensures cross-account table uniqueness
+- Handles `CreateTable` and `ListTables` operations
+- Fetched once and cached, keeping it out of the hot path
+
+<Note>
+  The registry is not involved in item operations. Routing happens deterministically at the edge with zero coordination overhead.
+</Note>
+
+## What shvm-db is NOT trying to do
+
+This is not about beating DynamoDB in production today. The MVP explicitly excludes:
+
+- Global tables / multi-region active writes
+- Automatic partition splitting
+- Secondary indexes (LSI / GSI)
+- Multi-item transactions
+- Strong cross-partition consistency
+- Hot partition mitigation
+- Encryption at rest
+- IAM-grade access control
+
+<Warning>
+  If it smells like Spanner, it's out of scope.
+</Warning>
+
+## What you'll gain
+
+By exploring shvm-db, you'll understand:
+
+### 1. Where DynamoDB's power comes from
+
+- **Deterministic routing** eliminates coordination overhead
+- **Single-writer partitions** make consistency trivial
+- **Partition-based scaling** makes throughput predictable
+
+### 2. Where the bottlenecks are
+
+- **Hot partitions** hit hard ceilings due to single-threaded execution
+- **SQLite lock contention** serializes writes within a partition
+- **Cross-partition operations** require aggregation across multiple DOs
+
+### 3. What tradeoffs distributed databases make
+
+- **Strong consistency** within a partition is cheap
+- **Strong consistency** across partitions is expensive (or impossible)
+- **Partition key design** determines your throughput ceiling
+
+## Learning-first correctness
+
+shvm-db prioritizes:
+
+- **Clarity over cleverness** - the code should teach, not impress
+- **Deterministic behavior** - no surprises, no hidden state
+- **Observable tradeoffs** - you can measure every bottleneck
+
+<Info>
+  Expected per-partition throughput: 500-2k writes/sec, 2k-10k reads/sec. System throughput scales linearly with partition count.
+</Info>
+
+## Cost model transparency
+
+Unlike DynamoDB's capacity planning, shvm-db's cost model is intentionally simple:
+
+- **Durable Object execution time** - short CPU bursts per request
+- **Durable Object storage** - one SQLite file per partition
+- **Request count** - one API request = one DO invocation (unless cache hit)
+
+You pay for actual usage, not theoretical capacity. No burst limits, no provisioned throughput, no capacity planning.
+
+<Note>
+  Hot partitions are expensive by design. Cold partitions are cheap. This matches the fundamental physics of single-writer architectures.
+</Note>
+
+## This is a forge
+
+Once you finish exploring shvm-db:
+
+- **DynamoDB stops feeling magical** - you've built the same primitives
+- **Distributed databases stop being abstract** - you've touched the bottlenecks
+- **You gain intuition that books don't give** - you've measured the tradeoffs
+
+This is not a toy. This is a **forge** for building distributed systems intuition.
+
+## Ready to build?
+
+<CardGroup cols={2}>
+  <Card title="Why shvm-db" icon="lightbulb" href="/why-shvm-db">
+    Learn when to use shvm-db vs alternatives
+  </Card>
+  
+  <Card title="Get started" icon="rocket" href="/quickstart">
+    Deploy shvm-db to Cloudflare Workers
+  </Card>
+</CardGroup>

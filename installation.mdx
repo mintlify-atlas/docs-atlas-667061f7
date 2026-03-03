@@ -1,0 +1,353 @@
+---
+title: Installation
+description: Complete installation and environment setup guide for shvm-db
+---
+
+This guide covers everything you need to install and configure shvm-db for local development and testing.
+
+## System Requirements
+
+### Required Software
+
+- **Node.js**: Version 18 or later
+- **npm**: Version 10.9.2 or later (as specified in `package.json`)
+- **Git**: For cloning the repository
+
+### Optional Tools
+
+- **Cloudflare account**: Required only for deployment
+- **Wrangler CLI**: Automatically installed as a dev dependency
+
+## Installation Methods
+
+<Tabs>
+  <Tab title="From Source (Recommended)">
+    ### Clone and Install
+
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/shivamd20/shvm-db.git
+        cd shvm-db
+        ```
+      </Step>
+
+      <Step title="Install dependencies">
+        ```bash
+        npm install
+        ```
+
+        This installs:
+        - `@cloudflare/vitest-pool-workers@^0.12.18`
+        - `@cloudflare/workers-types@^4.20240208.0`
+        - `@types/node@^24.10.1`
+        - `typescript@^5.5.2`
+        - `vitest@^3.0.0`
+        - `wrangler@^4.51.0`
+        - `zod@^4.3.6`
+      </Step>
+
+      <Step title="Verify installation">
+        ```bash
+        npx wrangler --version
+        ```
+
+        Expected output:
+        ```
+        ⛅️ wrangler 4.51.0 (or later)
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="One-Click Deploy">
+    ### Deploy to Cloudflare
+
+    Use the one-click deployment button to deploy directly to Cloudflare Workers:
+
+    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/shivamd20/shvm-db)
+
+    This will:
+    1. Fork the repository to your GitHub account
+    2. Configure Cloudflare Workers
+    3. Set up Durable Objects bindings
+    4. Deploy the worker automatically
+  </Tab>
+</Tabs>
+
+## Project Structure
+
+After installation, your project structure will look like:
+
+```
+shvm-db/
+├── src/
+│   ├── index.ts              # Main worker entry point
+│   ├── partition-do.ts       # PartitionDO implementation
+│   ├── table-registry-do.ts  # TableRegistryDO implementation
+│   ├── trace-do.ts           # TraceDO for observability
+│   ├── metadata-service.ts   # Table metadata management
+│   ├── cache.ts              # Edge cache manager
+│   ├── validation.ts         # Schema validation
+│   ├── dynamo-ast.ts         # DynamoDB expression parser
+│   └── sql/
+│       ├── queries.ts        # SQLite query builders
+│       └── migrations.ts     # Database migrations
+├── test/                     # Test files
+├── benchmarks/               # YCSB benchmarks
+├── wrangler.jsonc            # Cloudflare Workers config
+├── package.json              # Node.js dependencies
+└── tsconfig.json             # TypeScript configuration
+```
+
+## Configuration
+
+### Wrangler Configuration
+
+The `wrangler.jsonc` file contains the Cloudflare Workers configuration:
+
+```json
+{
+  "name": "shvm-db",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-28",
+  "placement": {
+    "mode": "smart"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PARTITION_DO",
+        "class_name": "PartitionDO"
+      },
+      {
+        "name": "TABLE_REGISTRY_DO",
+        "class_name": "TableRegistryDO"
+      },
+      {
+        "name": "TRACE_DO",
+        "class_name": "TraceDO"
+      }
+    ]
+  },
+  "compatibility_flags": [
+    "nodejs_compat"
+  ]
+}
+```
+
+### Environment Variables
+
+You can configure shvm-db using environment variables in `wrangler.jsonc`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHVM_DEBUG` | `"false"` | Enable debug logging |
+| `NUM_PARTITIONS` | `100` | Number of partition buckets for hash distribution |
+
+<Accordion title="Enable Debug Mode">
+  To enable debug logging, update `wrangler.jsonc`:
+
+  ```json
+  {
+    "vars": {
+      "SHVM_DEBUG": "true"
+    }
+  }
+  ```
+
+  Then restart the development server:
+  ```bash
+  npm run dev
+  ```
+</Accordion>
+
+### Durable Objects Migrations
+
+The configuration includes migration tags for Durable Objects:
+
+- **v3**: Introduces `PartitionDO`, `TableRegistryDO`
+- **v4**: Adds `TraceDO` for observability
+- **v5**: Removes deprecated `SubDO` class
+
+These migrations are automatically applied during deployment.
+
+## Development Server
+
+### Starting the Server
+
+<CodeGroup>
+```bash npm run dev
+npm run dev
+```
+
+```bash npm start
+npm start
+```
+
+```bash Direct wrangler
+npx wrangler dev
+```
+</CodeGroup>
+
+All three commands start the local development server with:
+- **Hot reload**: Automatic restarts on file changes
+- **Local storage**: Durable Objects persist to `.wrangler/state/`
+- **SQLite databases**: One per PartitionDO instance
+- **Port**: Default `8787`
+
+### Development Server Output
+
+```
+⛅️ wrangler 4.51.0
+-------------------
+Your worker has access to the following bindings:
+- Durable Objects:
+  - PARTITION_DO: PartitionDO
+  - TABLE_REGISTRY_DO: TableRegistryDO
+  - TRACE_DO: TraceDO
+- Vars:
+  - SHVM_DEBUG: "false"
+[wrangler:inf] Ready on http://localhost:8787
+```
+
+## TypeScript Support
+
+The project uses TypeScript 5.5.2 with strict configuration:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types", "@types/node"]
+  }
+}
+```
+
+### Generate Types
+
+Generate Cloudflare Workers types:
+
+```bash
+npm run cf-typegen
+```
+
+This runs `wrangler types` and creates `worker-configuration.d.ts`.
+
+## Testing Setup
+
+### Local Testing
+
+```bash
+npm run test:local
+```
+
+Runs Vitest tests against the local development server.
+
+### Live Testing
+
+```bash
+npm run test:live
+```
+
+Tests against a deployed instance at `https://db.shvm.in`.
+
+### Compatibility Testing
+
+```bash
+npm test
+```
+
+Runs the full DynamoDB compatibility test suite in `compat-test/`.
+
+## Benchmarking Setup
+
+shvm-db includes YCSB (Yahoo! Cloud Serving Benchmark) integration:
+
+<Steps>
+  <Step title="Setup benchmark scripts">
+    ```bash
+    npm run benchmark:setup
+    ```
+
+    This makes benchmark scripts executable.
+  </Step>
+
+  <Step title="Run local benchmarks">
+    ```bash
+    npm run benchmark:run
+    ```
+  </Step>
+
+  <Step title="Run live benchmarks">
+    ```bash
+    npm run benchmark:live
+    ```
+
+    Tests against the deployed endpoint at `https://db.shvm.in/api`.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Port 8787 already in use">
+    Kill the process using port 8787:
+    ```bash
+    lsof -ti:8787 | xargs kill -9
+    ```
+
+    Or specify a different port:
+    ```bash
+    npx wrangler dev --port 8788
+    ```
+  </Accordion>
+
+  <Accordion title="Durable Objects storage issues">
+    Clear local Durable Objects state:
+    ```bash
+    rm -rf .wrangler/state/
+    npm run dev
+    ```
+
+    This resets all local SQLite databases and Durable Objects.
+  </Accordion>
+
+  <Accordion title="TypeScript errors">
+    Regenerate worker types:
+    ```bash
+    npm run cf-typegen
+    ```
+
+    Ensure you're using Node.js 18+:
+    ```bash
+    node --version
+    ```
+  </Accordion>
+
+  <Accordion title="npm install fails">
+    Use the exact package manager version:
+    ```bash
+    npm --version  # Should be 10.9.2 or later
+    ```
+
+    Clear npm cache:
+    ```bash
+    npm cache clean --force
+    npm install
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Make your first API request
+  </Card>
+  <Card title="Deployment" icon="cloud" href="/deployment">
+    Deploy to Cloudflare Workers
+  </Card>
+</CardGroup>

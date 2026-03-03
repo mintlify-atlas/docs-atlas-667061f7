@@ -1,0 +1,314 @@
+---
+title: Trace API
+description: Query trace events for request observability and performance analysis
+---
+
+## Overview
+
+shvm-db includes a built-in tracing system that captures detailed performance metrics for every request. The Trace API allows you to query these events to understand request latency, debug performance issues, and gain observability into your database operations.
+
+## Trace Event Structure
+
+Each trace event captures a specific step in request processing:
+
+```typescript
+interface TraceEvent {
+  requestId: string;  // Unique identifier for the request
+  step: string;       // Name of the operation step
+  startMs: number;    // Start time relative to request start (ms)
+  durationMs: number; // Duration of this step (ms)
+  parent?: string;    // Parent step name (for nested operations)
+  attributes?: Record<string, string | number | boolean>; // Additional metadata
+}
+```
+
+### Common Step Names
+
+- `client_to_worker`: Time from client timestamp to worker invocation
+- `worker_routing`: Initial request routing overhead
+- `get_table_metadata`: Fetching table schema (from cache or registry)
+- `cache_read`: Reading from edge cache
+- `do_get_item`: Durable Object GetItem operation
+- `do_put_item`: Durable Object PutItem operation
+- `do_update_item`: Durable Object UpdateItem operation
+- `do_delete_item`: Durable Object DeleteItem operation
+- `request`: Overall request span with aggregated metrics
+
+### Trace Attributes
+
+The `request` step includes rich attributes:
+
+```typescript
+{
+  cold_path: boolean,           // Whether request hit cold path
+  worker_cold_start: boolean,   // Whether worker was cold started
+  request_bytes: number,        // Request payload size
+  response_bytes: number,       // Response payload size
+  cf_colo: string,             // Cloudflare colo (e.g., "SJC")
+  cf_client_tcp_rtt: number,   // Client TCP RTT in ms
+  cf_as_org: string,           // Client AS organization
+  metadata_source: string,     // "cache" or "registry"
+  hit: boolean,                // Cache hit/miss
+  type: string                 // Cache type ("item" or "table")
+}
+```
+
+## Querying Traces
+
+### Endpoint
+
+```
+GET /api/trace?requestId={requestId}
+```
+
+### Request Parameters
+
+- `requestId` (required): The request ID to query traces for
+
+### Request ID Sources
+
+The request ID can be obtained from:
+
+1. **Response headers**: Every shvm-db response includes `X-Request-Id`
+2. **Custom header**: Send `x-request-id` or `x-amz-request-id` with your request
+3. **Auto-generated**: If not provided, a UUID is generated
+
+### Response Format
+
+```json
+{
+  "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "events": [
+    {
+      "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "step": "worker_routing",
+      "startMs": 0,
+      "durationMs": 2.3
+    },
+    {
+      "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "step": "get_table_metadata",
+      "startMs": 2.3,
+      "durationMs": 15.7,
+      "attributes": {
+        "metadata_source": "cache"
+      }
+    },
+    {
+      "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "step": "cache_read",
+      "startMs": 18.0,
+      "durationMs": 3.2,
+      "attributes": {
+        "hit": true,
+        "type": "item"
+      }
+    },
+    {
+      "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "step": "request",
+      "startMs": 0,
+      "durationMs": 25.4,
+      "attributes": {
+        "cold_path": true,
+        "worker_cold_start": false,
+        "request_bytes": 156,
+        "response_bytes": 342,
+        "cf_colo": "SJC",
+        "cf_client_tcp_rtt": 12
+      }
+    }
+  ]
+}
+```
+
+## Usage Examples
+
+### Capture Request ID
+
+```javascript
+import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
+
+const client = new DynamoDBClient({
+  endpoint: "https://your-shvm-db.workers.dev"
+});
+
+const response = await client.send(
+  new GetItemCommand({
+    TableName: "users",
+    Key: { userId: { S: "user-123" } }
+  })
+);
+
+// Extract request ID from metadata
+const requestId = response.$metadata.requestId;
+console.log("Request ID:", requestId);
+```
+
+### Query Trace Events
+
+```javascript
+const traceUrl = `https://your-shvm-db.workers.dev/api/trace?requestId=${requestId}`;
+const traceResponse = await fetch(traceUrl);
+const trace = await traceResponse.json();
+
+console.log("Total request time:", trace.events.find(e => e.step === "request").durationMs, "ms");
+
+// Analyze cache performance
+const cacheReads = trace.events.filter(e => e.step === "cache_read");
+for (const read of cacheReads) {
+  console.log(`Cache ${read.attributes?.type}: ${read.attributes?.hit ? 'HIT' : 'MISS'} (${read.durationMs}ms)`);
+}
+```
+
+### Custom Request ID
+
+```javascript
+import { v4 as uuidv4 } from 'uuid';
+
+const customRequestId = uuidv4();
+
+const client = new DynamoDBClient({
+  endpoint: "https://your-shvm-db.workers.dev",
+  requestHandler: {
+    metadata: { requestId: customRequestId }
+  }
+});
+
+// Or using fetch directly
+const response = await fetch("https://your-shvm-db.workers.dev", {
+  method: "POST",
+  headers: {
+    "x-request-id": customRequestId,
+    "x-amz-target": "DynamoDB_20120810.GetItem",
+    "Content-Type": "application/x-amz-json-1.0"
+  },
+  body: JSON.stringify({
+    TableName: "users",
+    Key: { userId: { S: "user-123" } }
+  })
+});
+
+// Query trace immediately
+const trace = await fetch(`https://your-shvm-db.workers.dev/api/trace?requestId=${customRequestId}`);
+```
+
+### Performance Analysis
+
+```javascript
+async function analyzeRequestPerformance(requestId) {
+  const response = await fetch(`https://your-shvm-db.workers.dev/api/trace?requestId=${requestId}`);
+  const { events } = await response.json();
+  
+  const breakdown = {};
+  
+  for (const event of events) {
+    if (event.step === "request") continue;
+    breakdown[event.step] = (breakdown[event.step] || 0) + event.durationMs;
+  }
+  
+  console.log("Performance breakdown:");
+  for (const [step, duration] of Object.entries(breakdown).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${step}: ${duration.toFixed(2)}ms`);
+  }
+  
+  const requestEvent = events.find(e => e.step === "request");
+  if (requestEvent?.attributes) {
+    console.log("\nRequest metadata:");
+    console.log(`  Cold start: ${requestEvent.attributes.worker_cold_start}`);
+    console.log(`  Colo: ${requestEvent.attributes.cf_colo}`);
+    console.log(`  TCP RTT: ${requestEvent.attributes.cf_client_tcp_rtt}ms`);
+  }
+}
+
+await analyzeRequestPerformance("your-request-id");
+```
+
+## Trace Retention
+
+Trace events are retained for **2 hours** (see `src/trace-do.ts:6`). After this period, events are automatically evicted from storage.
+
+```typescript
+const TRACE_RETENTION_MS = 2 * 60 * 60 * 1000; // 2 hours
+```
+
+## Trace Flushing
+
+Trace events are buffered in-memory and flushed to Durable Object storage in batches:
+
+- **Flush delay**: 2 seconds after the first event
+- **Batch size**: Up to 10 events per SQL insert
+- **Automatic retry**: Failed flushes are re-queued
+
+This batching approach minimizes write overhead while ensuring trace data is persisted for querying.
+
+## Trace Summary Header
+
+Every response includes a trace summary in the `X-SHIVAM-DB-Trace-Summary` header:
+
+```
+X-SHIVAM-DB-Trace-Summary: total_ms=25.4,worker_routing_ms=2.3,get_table_metadata_ms=15.7,cache_read_ms=3.2,get_table_metadata_metadata_source=cache,cache_read_hit=true,cache_read_type=item
+```
+
+This provides at-a-glance performance metrics without requiring a separate trace query.
+
+## Storage Schema
+
+Traces are stored in SQLite with the following schema (see `src/sql/queries.ts:3-16`):
+
+```sql
+CREATE TABLE IF NOT EXISTS trace_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  step TEXT NOT NULL,
+  start_ms REAL NOT NULL,
+  duration_ms REAL NOT NULL,
+  parent TEXT,
+  attributes TEXT,  -- JSON string
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_trace_events_request_id ON trace_events(request_id);
+CREATE INDEX idx_trace_events_created_at ON trace_events(created_at);
+```
+
+## Error Handling
+
+### Missing Request ID
+
+```json
+{
+  "error": "Missing requestId"
+}
+```
+
+HTTP Status: `400 Bad Request`
+
+### Request ID Not Found
+
+If the request ID doesn't exist or traces have expired:
+
+```json
+{
+  "requestId": "unknown-id",
+  "events": []
+}
+```
+
+HTTP Status: `200 OK`
+
+## Implementation Reference
+
+- **Trace Durable Object**: `src/trace-do.ts`
+- **Event recording**: `src/index.ts:153-155` (addEvent function)
+- **Trace flushing**: `src/index.ts:157-161` (flushTrace function)
+- **Query endpoint**: `src/index.ts:78-88`
+- **Storage queries**: `src/sql/queries.ts:1-23`
+
+## Best Practices
+
+1. **Use custom request IDs** for critical operations to easily correlate traces with application logs
+2. **Query traces immediately** after slow requests to capture data before retention expires
+3. **Monitor cache hit rates** using trace attributes to optimize caching strategy
+4. **Track cold starts** to understand performance variability
+5. **Analyze step durations** to identify bottlenecks in request processing

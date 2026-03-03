@@ -1,0 +1,183 @@
+---
+title: Architecture Overview
+description: High-level system architecture and core design principles of shvm-db
+---
+
+## Introduction
+
+shvm-db is a DynamoDB-compatible database built on Cloudflare's serverless infrastructure. It demonstrates how distributed database concepts like partitioning, routing, and consistency can be implemented using modern serverless primitives.
+
+## Core Architecture
+
+The system uses a **pure, deterministic routing architecture** that separates table orchestration from partition storage:
+
+```
+Client Request
+    ↓
+API Gateway (Worker)
+    ↓
+[Table Registry] ← Metadata lookup (cached)
+    ↓
+Hash-based Routing
+    ↓
+PartitionDO (Single-writer per partition)
+    ↓
+SQLite Storage (per partition)
+```
+
+## Key Components
+
+### 1. API Gateway (Worker)
+
+- Provides DynamoDB-compatible HTTP interface
+- Handles request parsing and validation
+- Implements edge caching layer (Cloudflare Cache API)
+- Routes requests to appropriate Durable Objects
+
+### 2. TableRegistryDO (Global Registry)
+
+- Single global Durable Object (`global-registry`)
+- Stores metadata for all tables
+- Handles `CreateTable`, `DeleteTable`, `ListTables`, `DescribeTable`
+- Metadata cached at edge for 2 hours
+- Completely out of hot path for item operations
+
+### 3. PartitionDO (Data Plane)
+
+- Maps deterministically to `TableName + PartitionKey` hash
+- Owns exactly one SQLite database
+- Single-writer guarantee per partition
+- Serves as sole authority for that partition's data
+
+### 4. SQLite Storage Engine
+
+- One SQLite database per partition
+- Runs in WAL (Write-Ahead Logging) mode
+- **The source of truth** for all data
+- Provides ACID guarantees within partition
+
+## Design Principles
+
+### Zero Routing Overhead
+
+> **One Partition Key → SHA-256 Hash → One PartitionDO**
+
+There is:
+- No in-memory routing map
+- No control-plane lookup during item access
+- No background queues for data replication
+- No additional layers between request and storage
+
+### Single-Writer Per Partition
+
+Each partition is owned by exactly one Durable Object, which provides:
+- Strong consistency for all operations on that partition
+- Serialized write execution (no conflicts)
+- Read-after-write consistency within partition
+
+### Edge-Level Caching
+
+Cloudflare Cache API provides:
+- **GetItem**: 5-minute TTL (300 seconds)
+- **Schemas**: 2-hour TTL (7200 seconds)
+- Write-through on PutItem/UpdateItem
+- Cache invalidation on DeleteItem
+- Bypasses DO invocation on cache hits
+
+## Data Flow
+
+### Write Path (PutItem)
+
+1. **API Gateway**: Worker hashes `tableName + PK` → `PartitionDO ID`
+2. **Validation**: Worker validates item against cached table schema
+3. **Routing**: Worker forwards request to PartitionDO
+4. **Transaction**: DO evaluates condition expressions (if any)
+5. **Commit**: DO executes `INSERT OR REPLACE` into SQLite
+6. **Cache**: Worker updates edge cache with new value
+7. **Ack**: Returns success to client
+
+### Read Path (GetItem)
+
+1. **API Gateway**: Worker hashes `tableName + PK` → `PartitionDO ID`
+2. **Cache Check**: Worker checks Cloudflare Cache API
+3. **Hit**: Returns instantly without waking DO
+4. **Miss**: Worker forwards request to PartitionDO
+5. **Execution**: DO executes SQLite `SELECT`
+6. **Cache Update**: Worker populates edge cache via `ctx.waitUntil`
+7. **Return**: Returns result to client
+
+## Scalability Model
+
+### Horizontal Scaling
+
+- **Linear in number of partitions**
+- Each partition can handle 500-2k writes/sec, 2k-10k reads/sec
+- 1000 partitions ≈ millions of ops/sec (theoretical)
+
+### Bottlenecks (By Design)
+
+1. **Hot Partition**: Single partition ceiling at ~1,000 WCU (mirrors DynamoDB)
+2. **Single-threaded**: Each DO runs on single JavaScript isolate
+3. **SQLite Lock Contention**: Serialized writes within partition
+
+## Fault Tolerance
+
+### Durable Object Crash
+
+- SQLite file persists in DO storage
+- On restart: Open SQLite and continue serving
+- WAL recovery handled by SQLite automatically
+
+### Data Durability
+
+- Relies on Cloudflare Durable Object storage guarantees
+- SQLite WAL ensures atomicity and durability
+- No external backup in MVP (R2 integration planned)
+
+## Performance Characteristics
+
+### Per Partition (Single DO)
+
+| Metric | Expected |
+|--------|----------|
+| Write latency | 3–10 ms |
+| Read latency (cache hit) | < 1 ms |
+| Read latency (cache miss) | 2–8 ms |
+| Write throughput | 500–2k ops/sec |
+| Read throughput | 2k–10k ops/sec |
+
+### System Throughput
+
+Scales linearly with partition count:
+- Well-distributed workload: Millions of ops/sec
+- Hot key workload: Limited by single partition ceiling
+
+## What's NOT in MVP
+
+The following are explicitly excluded:
+
+- Global tables / multi-region active writes
+- Automatic partition splitting
+- Secondary indexes (LSI/GSI)
+- Multi-item transactions
+- Strong cross-partition consistency
+- Hot partition mitigation
+- Encryption at rest
+- IAM-grade access control
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Data Model" icon="database" href="/architecture/data-model">
+    Understand table and item structure
+  </Card>
+  <Card title="Partitioning" icon="table-cells" href="/architecture/partitioning">
+    Learn hash-based partition routing
+  </Card>
+  <Card title="Durable Objects" icon="cube" href="/architecture/durable-objects">
+    Deep dive into DO internals
+  </Card>
+  <Card title="Consistency" icon="check-double" href="/architecture/consistency">
+    Explore consistency guarantees
+  </Card>
+</CardGroup>

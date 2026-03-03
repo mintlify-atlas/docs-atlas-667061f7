@@ -1,0 +1,416 @@
+---
+title: UpdateItem
+description: Modify specific attributes of an existing item without replacing the entire item
+---
+
+## Overview
+
+The `UpdateItem` operation edits an existing item's attributes or creates a new item if it doesn't exist. Unlike `PutItem`, which replaces the entire item, `UpdateItem` allows you to modify specific attributes while leaving others unchanged.
+
+## Request Structure
+
+```json
+{
+  "TableName": "string",
+  "Key": {
+    "AttributeName": AttributeValue,
+    ...
+  },
+  "UpdateExpression": "string",
+  "ConditionExpression": "string",
+  "ExpressionAttributeNames": {
+    "#placeholder": "AttributeName",
+    ...
+  },
+  "ExpressionAttributeValues": {
+    ":value": AttributeValue,
+    ...
+  },
+  "ReturnValues": "NONE" | "ALL_OLD" | "ALL_NEW" | "UPDATED_OLD" | "UPDATED_NEW",
+  "AttributeUpdates": {
+    "AttributeName": {
+      "Value": AttributeValue,
+      "Action": "PUT" | "DELETE" | "ADD"
+    },
+    ...
+  }
+}
+```
+
+## Parameters
+
+<ParamField path="TableName" type="string" required>
+  The name of the table containing the item to update.
+</ParamField>
+
+<ParamField path="Key" type="object" required>
+  A map of attribute names to AttributeValue objects representing the primary key of the item to update.
+</ParamField>
+
+<ParamField path="UpdateExpression" type="string">
+  An expression that defines the attributes to update and how to update them. Supports SET, REMOVE, ADD, and DELETE clauses.
+  
+  **Note**: In the current implementation, `UpdateExpression` is partially supported. Use `AttributeUpdates` for legacy syntax.
+  
+  Examples:
+  - `SET #email = :newEmail, #updatedAt = :timestamp`
+  - `REMOVE tempAttribute`
+  - `ADD #loginCount :increment`
+</ParamField>
+
+<ParamField path="AttributeUpdates" type="object">
+  Legacy syntax for specifying attribute updates. Each attribute update contains:
+  - `Value`: The new value for the attribute
+  - `Action`: PUT (set/replace), DELETE (remove), or ADD (increment/add to set)
+  
+  **Note**: Cannot be used together with `UpdateExpression`.
+</ParamField>
+
+<ParamField path="ConditionExpression" type="string">
+  A condition that must be satisfied for the update to succeed. The update fails if the condition evaluates to false.
+  
+  Examples:
+  - Optimistic locking: `#version = :expectedVersion`
+  - Update only if attribute exists: `attribute_exists(#email)`
+  - Update only if value matches: `#status = :oldStatus`
+</ParamField>
+
+<ParamField path="ExpressionAttributeNames" type="object">
+  A map of placeholder names to actual attribute names. Required when:
+  - Attribute names are reserved words
+  - Attribute names contain special characters
+  - Attribute names are used in expressions
+</ParamField>
+
+<ParamField path="ExpressionAttributeValues" type="object">
+  A map of placeholder values used in update and condition expressions.
+</ParamField>
+
+<ParamField path="ReturnValues" type="string">
+  Determines what values are returned after the update:
+  
+  - `NONE` (default): Nothing is returned
+  - `ALL_OLD`: Returns all attributes as they appeared before the update
+  - `ALL_NEW`: Returns all attributes as they appear after the update
+  - `UPDATED_OLD`: Returns only updated attributes (before)
+  - `UPDATED_NEW`: Returns only updated attributes (after)
+  
+  **Note**: Currently only `ALL_NEW` is fully implemented.
+</ParamField>
+
+## Response Structure
+
+```json
+{
+  "Attributes": {
+    "AttributeName": AttributeValue,
+    ...
+  }
+}
+```
+
+<ResponseField name="Attributes" type="object">
+  The attribute values as they appear after the update. Only returned if `ReturnValues` is set to `ALL_NEW` (or other non-NONE values in the full DynamoDB spec).
+</ResponseField>
+
+## Examples
+
+### Update Using AttributeUpdates (Legacy Syntax)
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.UpdateItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "AttributeUpdates": {
+      "email": {
+        "Value": {"S": "newemail@example.com"},
+        "Action": "PUT"
+      },
+      "lastLogin": {
+        "Value": {"N": "1677649200"},
+        "Action": "PUT"
+      }
+    },
+    "ReturnValues": "ALL_NEW"
+  }'
+```
+
+**Response:**
+```json
+{
+  "Attributes": {
+    "userId": {"S": "user123"},
+    "email": {"S": "newemail@example.com"},
+    "lastLogin": {"N": "1677649200"},
+    "createdAt": {"N": "1670000000"}
+  }
+}
+```
+
+### Update Using UpdateExpression
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.UpdateItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "UpdateExpression": "SET #email = :newEmail, #updated = :timestamp",
+    "ExpressionAttributeNames": {
+      "#email": "email",
+      "#updated": "updatedAt"
+    },
+    "ExpressionAttributeValues": {
+      ":newEmail": {"S": "updated@example.com"},
+      ":timestamp": {"N": "1677649200"}
+    },
+    "ReturnValues": "ALL_NEW"
+  }'
+```
+
+### Conditional Update with Version Check
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.UpdateItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "UpdateExpression": "SET #status = :newStatus, #version = #version + :inc",
+    "ConditionExpression": "#version = :expectedVersion",
+    "ExpressionAttributeNames": {
+      "#status": "status",
+      "#version": "version"
+    },
+    "ExpressionAttributeValues": {
+      ":newStatus": {"S": "ACTIVE"},
+      ":expectedVersion": {"N": "1"},
+      ":inc": {"N": "1"}
+    },
+    "ReturnValues": "ALL_NEW"
+  }'
+```
+
+### Delete Attribute Using AttributeUpdates
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.UpdateItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    },
+    "AttributeUpdates": {
+      "tempToken": {
+        "Action": "DELETE"
+      }
+    }
+  }'
+```
+
+### Increment Counter
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.UpdateItem" \
+  -d '{
+    "TableName": "Analytics",
+    "Key": {
+      "metricId": {"S": "page-views"}
+    },
+    "UpdateExpression": "ADD #count :increment",
+    "ExpressionAttributeNames": {
+      "#count": "viewCount"
+    },
+    "ExpressionAttributeValues": {
+      ":increment": {"N": "1"}
+    },
+    "ReturnValues": "ALL_NEW"
+  }'
+```
+
+## Error Responses
+
+### ConditionalCheckFailedException
+
+Returned when the condition expression evaluates to false.
+
+```json
+{
+  "__type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed"
+}
+```
+
+**Status Code:** 400
+
+Common scenarios:
+- Version mismatch in optimistic locking
+- Attribute doesn't match expected value
+- Attribute doesn't exist when `attribute_exists()` is used
+
+### ValidationException
+
+Returned when the request is malformed.
+
+```json
+{
+  "__type": "ValidationException",
+  "message": "Invalid UpdateExpression: Syntax error"
+}
+```
+
+**Status Code:** 400
+
+Common causes:
+- Invalid UpdateExpression syntax
+- Missing key attributes
+- Both `UpdateExpression` and `AttributeUpdates` provided
+- Invalid Action value in AttributeUpdates
+
+### ResourceNotFoundException
+
+Returned when the specified table does not exist.
+
+```json
+{
+  "__type": "ResourceNotFoundException",
+  "message": "Cannot do operations on a non-existent table"
+}
+```
+
+**Status Code:** 400
+
+## Implementation Details
+
+### Update Execution Flow
+
+The `UpdateItem` operation follows this sequence:
+
+1. **Fetch Current Item**: Retrieve the existing item from SQLite
+   ```sql
+   SELECT value FROM items_v3 WHERE id = ? AND deleted = 0
+   ```
+
+2. **Evaluate Condition**: If `ConditionExpression` is provided, evaluate against current item
+   - Throws `ConditionalCheckFailedException` if condition fails
+
+3. **Apply Updates**: 
+   - If `UpdateExpression`: Parse and evaluate the expression AST
+   - If `AttributeUpdates`: Apply PUT/DELETE actions
+
+4. **Write Updated Item**: Store the modified item
+   ```sql
+   INSERT OR REPLACE INTO items_v3 (id, version, value, deleted) VALUES (?, 1, ?, 0)
+   ```
+
+5. **Cache Management**:
+   - If `ReturnValues = ALL_NEW`: Write updated item to cache
+   - Otherwise: Invalidate cache to force fresh reads
+
+See [partition-do.ts:142-177](https://github.com/shivamd20/shvm-db/blob/main/src/partition-do.ts#L142-L177) for the implementation.
+
+### UpdateExpression Support
+
+The current implementation supports:
+- ✅ SET clause (assign values)
+- ✅ REMOVE clause (delete attributes)
+- ✅ ADD clause (increment numbers, add to sets)
+- ✅ DELETE clause (remove from sets)
+- ✅ Expression attribute names and values
+- ⚠️  Partial support for complex nested paths
+
+### AttributeUpdates Actions
+
+| Action | Behavior |
+|--------|----------|
+| PUT | Set attribute to specified value (creates if doesn't exist) |
+| DELETE | Remove attribute from item (Value not required) |
+| ADD | Increment number or add to set (not fully implemented) |
+
+### Upsert Behavior
+
+If the item doesn't exist, `UpdateItem` creates it with the specified updates applied. This is equivalent to:
+```
+item = {}
+apply_updates(item)
+store(item)
+```
+
+## Performance Characteristics
+
+| Metric | Expected Range |
+|--------|----------------|
+| Latency | 3-10ms |
+| Throughput (per partition) | 500-2,000 ops/sec |
+
+Performance considerations:
+- Read-modify-write operations are slower than pure writes
+- Complex UpdateExpressions add parsing overhead
+- Condition evaluation requires fetching current item
+
+## Best Practices
+
+### Optimistic Locking
+
+Use a version attribute to prevent lost updates:
+
+```json
+{
+  "UpdateExpression": "SET #data = :newData, #version = #version + :inc",
+  "ConditionExpression": "#version = :expectedVersion",
+  "ExpressionAttributeNames": {
+    "#data": "userData",
+    "#version": "version"
+  },
+  "ExpressionAttributeValues": {
+    ":newData": {"M": {...}},
+    ":expectedVersion": {"N": "5"},
+    ":inc": {"N": "1"}
+  }
+}
+```
+
+### Atomic Counters
+
+Increment counters atomically without race conditions:
+
+```json
+{
+  "UpdateExpression": "ADD #count :increment",
+  "ExpressionAttributeNames": {"#count": "viewCount"},
+  "ExpressionAttributeValues": {":increment": {"N": "1"}}
+}
+```
+
+### Conditional Creates
+
+Create item only if it doesn't exist:
+
+```json
+{
+  "UpdateExpression": "SET #email = :email, #created = :timestamp",
+  "ConditionExpression": "attribute_not_exists(userId)",
+  ...
+}
+```
+
+## Related Operations
+
+- [PutItem](/api/put-item) - Replace entire item
+- [GetItem](/api/get-item) - Retrieve an item
+- [DeleteItem](/api/delete-item) - Remove an item

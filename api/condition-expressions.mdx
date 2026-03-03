@@ -1,0 +1,217 @@
+---
+title: Condition Expressions
+description: Syntax and evaluation of condition expressions in shvm-db
+---
+
+## Overview
+
+Condition expressions allow you to specify conditions that must be met for write operations (PutItem, UpdateItem, DeleteItem) to succeed. If the condition evaluates to false, the operation fails with a conditional check failure.
+
+## Supported Syntax
+
+shvm-db implements a subset of DynamoDB condition expression syntax:
+
+### attribute_not_exists()
+
+Checks if an attribute does not exist in the item.
+
+```javascript
+{
+  TableName: "users",
+  Key: { id: { S: "user123" } },
+  Item: { id: { S: "user123" }, name: { S: "Alice" } },
+  ConditionExpression: "attribute_not_exists(id)"
+}
+```
+
+This ensures the item doesn't already exist before creating it.
+
+**With Expression Attribute Names:**
+
+```javascript
+{
+  ConditionExpression: "attribute_not_exists(#status)",
+  ExpressionAttributeNames: {
+    "#status": "status"
+  }
+}
+```
+
+### Equality Comparison
+
+Checks if an attribute equals a specific value.
+
+```javascript
+{
+  TableName: "users",
+  Key: { id: { S: "user123" } },
+  UpdateExpression: "SET #status = :newStatus",
+  ConditionExpression: "#status = :expectedStatus",
+  ExpressionAttributeNames: {
+    "#status": "status"
+  },
+  ExpressionAttributeValues: {
+    ":expectedStatus": { S: "active" },
+    ":newStatus": { S: "inactive" }
+  }
+}
+```
+
+This performs an optimistic locking check, ensuring the status hasn't changed since it was read.
+
+## Expression Attribute Names
+
+Use `ExpressionAttributeNames` to:
+- Reference reserved keywords (e.g., `status`, `name`, `exists`)
+- Handle attribute names with special characters
+
+```javascript
+{
+  ConditionExpression: "#n = :val",
+  ExpressionAttributeNames: {
+    "#n": "name"  // "name" is a reserved keyword
+  },
+  ExpressionAttributeValues: {
+    ":val": { S: "Alice" }
+  }
+}
+```
+
+## Expression Attribute Values
+
+Use `ExpressionAttributeValues` to provide values referenced in the expression:
+
+```javascript
+{
+  ConditionExpression: "version = :v",
+  ExpressionAttributeValues: {
+    ":v": { N: "5" }
+  }
+}
+```
+
+## Evaluation Logic
+
+Condition expressions are evaluated in `src/dynamo-ast.ts:3` before write operations:
+
+1. **Empty expression**: If no `ConditionExpression` is provided, the condition is considered met (returns `true`)
+
+2. **attribute_not_exists()**: 
+   - Extracts the attribute name from the expression
+   - Maps expression attribute names if provided
+   - Returns `false` if the attribute exists in the current item
+   - Returns `true` if the attribute does not exist
+   - Throws `ValidationError` if the attribute name is a reserved keyword without proper mapping
+
+3. **Equality comparison** (`attr = :value`):
+   - Extracts the attribute name and value placeholder
+   - Maps attribute names and values through their respective dictionaries
+   - Performs deep equality check using `JSON.stringify()`
+   - Returns `true` if values match, `false` otherwise
+
+## Reserved Keywords
+
+The following attribute names are reserved and must be referenced using expression attribute names:
+
+- `exists`
+- `name`
+- `status`
+
+Attempting to use these directly will result in a `ValidationError`:
+
+```javascript
+// ❌ This will fail
+{
+  ConditionExpression: "status = :val"
+}
+
+// ✅ This works
+{
+  ConditionExpression: "#s = :val",
+  ExpressionAttributeNames: {
+    "#s": "status"
+  }
+}
+```
+
+## Error Handling
+
+When a condition expression fails:
+
+```json
+{
+  "__type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed"
+}
+```
+
+When using reserved keywords incorrectly:
+
+```json
+{
+  "__type": "ValidationException",
+  "message": "Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: status"
+}
+```
+
+## Examples
+
+### Prevent Duplicate Creation
+
+```javascript
+const params = {
+  TableName: "products",
+  Item: {
+    productId: { S: "prod-123" },
+    name: { S: "Widget" },
+    price: { N: "19.99" }
+  },
+  ConditionExpression: "attribute_not_exists(productId)"
+};
+
+await dynamoClient.send(new PutItemCommand(params));
+```
+
+### Optimistic Locking
+
+```javascript
+const params = {
+  TableName: "orders",
+  Key: { orderId: { S: "order-456" } },
+  UpdateExpression: "SET #v = #v + :inc, #status = :newStatus",
+  ConditionExpression: "#v = :expectedVersion",
+  ExpressionAttributeNames: {
+    "#v": "version",
+    "#status": "status"
+  },
+  ExpressionAttributeValues: {
+    ":expectedVersion": { N: "3" },
+    ":inc": { N: "1" },
+    ":newStatus": { S: "processing" }
+  }
+};
+
+await dynamoClient.send(new UpdateItemCommand(params));
+```
+
+### Conditional Delete
+
+```javascript
+const params = {
+  TableName: "sessions",
+  Key: { sessionId: { S: "sess-789" } },
+  ConditionExpression: "#status = :inactive",
+  ExpressionAttributeNames: {
+    "#status": "status"
+  },
+  ExpressionAttributeValues: {
+    ":inactive": { S: "inactive" }
+  }
+};
+
+await dynamoClient.send(new DeleteItemCommand(params));
+```
+
+## Implementation Reference
+
+The condition expression evaluator is implemented in `src/dynamo-ast.ts:3-34`. It provides basic pattern matching for the supported syntax and validates attribute names against reserved keywords.

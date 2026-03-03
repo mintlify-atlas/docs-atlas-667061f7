@@ -1,0 +1,276 @@
+---
+title: GetItem
+description: Retrieve a single item by primary key with sub-millisecond latency
+---
+
+## Overview
+
+The `GetItem` operation retrieves a single item from a table by primary key. This operation provides strongly consistent reads from the partition's Durable Object, with optional edge caching for ultra-low latency.
+
+## Request Structure
+
+```json
+{
+  "TableName": "string",
+  "Key": {
+    "AttributeName": AttributeValue,
+    ...
+  },
+  "ConsistentRead": boolean
+}
+```
+
+## Parameters
+
+<ParamField path="TableName" type="string" required>
+  The name of the table containing the item to retrieve.
+</ParamField>
+
+<ParamField path="Key" type="object" required>
+  A map of attribute names to AttributeValue objects representing the primary key of the item.
+  
+  - For tables with only a partition key, provide the partition key attribute
+  - For tables with both partition and sort keys, provide both attributes
+  
+  Key attributes cannot have empty string values.
+</ParamField>
+
+<ParamField path="ConsistentRead" type="boolean">
+  Determines the read consistency model. Currently not implemented in MVP - all reads are strongly consistent from the partition leader.
+  
+  Future: Will support eventually consistent reads from replicas.
+</ParamField>
+
+## Response Structure
+
+```json
+{
+  "Item": {
+    "AttributeName": AttributeValue,
+    ...
+  }
+}
+```
+
+<ResponseField name="Item" type="object">
+  A map of attribute names to AttributeValue objects representing the item. If the item does not exist, this field is omitted from the response.
+</ResponseField>
+
+## Examples
+
+### Get Item with Partition Key Only
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.GetItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "Item": {
+    "userId": {"S": "user123"},
+    "email": {"S": "user@example.com"},
+    "createdAt": {"N": "1677649200"},
+    "status": {"S": "ACTIVE"}
+  }
+}
+```
+
+### Get Item with Composite Key
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.GetItem" \
+  -d '{
+    "TableName": "Orders",
+    "Key": {
+      "customerId": {"S": "customer456"},
+      "orderId": {"S": "order789"}
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "Item": {
+    "customerId": {"S": "customer456"},
+    "orderId": {"S": "order789"},
+    "total": {"N": "99.99"},
+    "status": {"S": "SHIPPED"},
+    "items": {"L": [
+      {"M": {"sku": {"S": "PROD1"}, "qty": {"N": "2"}}}
+    ]}
+  }
+}
+```
+
+### Item Not Found
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.GetItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "nonexistent"}
+    }
+  }'
+```
+
+**Response:**
+```json
+{}
+```
+
+### Using Request ID for Tracing
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.GetItem" \
+  -H "X-Request-Id: req-12345" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": {"S": "user123"}
+    }
+  }'
+```
+
+You can then trace the request using the trace API:
+```bash
+curl https://your-worker.workers.dev/api/trace?requestId=req-12345
+```
+
+## Error Responses
+
+### ValidationException
+
+Returned when the request contains invalid parameters.
+
+```json
+{
+  "__type": "ValidationException",
+  "message": "One of the required keys was not given a value"
+}
+```
+
+**Status Code:** 400
+
+Common causes:
+- Missing key attributes
+- Empty string value for key attribute
+- Type mismatch for key attribute (e.g., providing N when S is expected)
+
+### ResourceNotFoundException
+
+Returned when the specified table does not exist.
+
+```json
+{
+  "__type": "ResourceNotFoundException",
+  "message": "Cannot do operations on a non-existent table"
+}
+```
+
+**Status Code:** 400
+
+## Implementation Details
+
+### Read Path Architecture
+
+The `GetItem` operation uses a multi-tier caching strategy:
+
+1. **Edge Cache Check**: Worker checks Cloudflare Cache API (5-minute TTL)
+   - Cache hit: Return immediately without waking Durable Object
+   - Cache miss: Proceed to step 2
+
+2. **Partition Routing**: Hash partition key to determine target `PartitionDO`
+   ```
+   partition_id = hash(PK) % NUM_PARTITIONS
+   ```
+
+3. **Durable Object Read**: Execute SQLite SELECT query
+   ```sql
+   SELECT value FROM items_v3 WHERE id = ? AND deleted = 0
+   ```
+
+4. **Cache Population**: Use `ctx.waitUntil()` to populate edge cache asynchronously
+
+5. **Response**: Return item to client
+
+See [index.ts:306-356](https://github.com/shivamd20/shvm-db/blob/main/src/index.ts#L306-L356) for the implementation.
+
+### Cache Behavior
+
+- **TTL**: 5 minutes (300 seconds) for item data
+- **Invalidation**: Automatic on `PutItem`, `UpdateItem`, and `DeleteItem`
+- **Tombstones**: Deleted items are cached as tombstones to prevent unnecessary DO invocations
+
+### Consistency Model
+
+- **Strong consistency**: All reads come from the partition leader (the single Durable Object)
+- **Read-after-write**: Guaranteed for the same partition key
+- **Cache coherence**: Write-through invalidation ensures cache is always fresh or stale by at most 5 minutes
+
+## Performance Characteristics
+
+| Metric | Expected Range |
+|--------|----------------|
+| Latency (cache hit) | Less than 1ms |
+| Latency (cache miss) | 2-8ms |
+| Throughput (per partition) | 2,000-10,000 ops/sec |
+| Throughput (cached) | 50,000+ ops/sec |
+
+### Response Headers
+
+The response includes custom headers for debugging and observability:
+
+```
+X-Request-Id: <request-id>
+X-SHIVAM-DB-OP: GetItem
+X-SHIVAM-DB-TABLE: Users
+X-SHIVAM-DB-PARTITION-ID-INTERNAL: 42
+X-SHIVAM-DB-PARTITION-KEY: Users::partition-42
+X-SHIVAM-DB-SK: user123
+X-SHIVAM-DB-Trace-Summary: total_ms=4.2,cache_read_ms=0.3,do_get_item_ms=3.1
+```
+
+### Trace Summary
+
+The `X-SHIVAM-DB-Trace-Summary` header provides a breakdown of latency:
+
+- `total_ms`: Total request duration
+- `cache_read_ms`: Time spent checking cache
+- `do_get_item_ms`: Time spent in Durable Object (if cache miss)
+- `partition_sql_read_ms`: SQLite query execution time
+- `worker_routing_ms`: Worker routing overhead
+- `client_to_worker_ms`: Network time from client (if `X-SHVM-Client-Ts` header provided)
+
+## Cold Start Behavior
+
+When a Durable Object is cold (first request or after eviction):
+
+1. Cloudflare loads the Durable Object code
+2. Constructor runs, initializing SQLite connection
+3. Migrations execute (idempotent schema setup)
+4. Request is processed
+
+Cold start adds approximately 50-200ms to the first request. Subsequent requests are hot.
+
+## Related Operations
+
+- [PutItem](/api/put-item) - Create or replace an item
+- [UpdateItem](/api/update-item) - Modify specific attributes
+- [DeleteItem](/api/delete-item) - Remove an item

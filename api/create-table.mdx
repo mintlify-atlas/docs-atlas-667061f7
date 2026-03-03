@@ -1,0 +1,224 @@
+---
+title: CreateTable
+description: Create a new DynamoDB table with specified key schema and attributes
+---
+
+Creates a new table in shvm-db with the specified key schema, attribute definitions, and billing configuration.
+
+## Request
+
+### Endpoint
+
+```bash
+POST /
+```
+
+### Headers
+
+```bash
+Content-Type: application/x-amz-json-1.0
+x-amz-target: DynamoDB_20120810.CreateTable
+```
+
+### Request Body
+
+<ParamField path="TableName" type="string" required>
+  Name of the table to create. Must be between 3 and 255 characters.
+</ParamField>
+
+<ParamField path="KeySchema" type="array" required>
+  Array of key schema elements defining the primary key structure. Must contain 1-2 elements.
+  
+  <Expandable title="KeySchemaElement">
+    <ParamField path="AttributeName" type="string" required>
+      Name of the key attribute. Must be at least 1 character.
+    </ParamField>
+    
+    <ParamField path="KeyType" type="enum" required>
+      Type of key. Must be one of:
+      - `HASH` - Partition key
+      - `RANGE` - Sort key
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="AttributeDefinitions" type="array" required>
+  Array of attribute definitions for key attributes. Must contain at least 1 element.
+  
+  <Expandable title="AttributeDefinition">
+    <ParamField path="AttributeName" type="string" required>
+      Name of the attribute. Must be at least 1 character.
+    </ParamField>
+    
+    <ParamField path="AttributeType" type="enum" required>
+      Data type of the attribute. Must be one of:
+      - `S` - String
+      - `N` - Number
+      - `B` - Binary
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="ProvisionedThroughput" type="object">
+  Provisioned throughput settings. Required when BillingMode is `PROVISIONED`.
+  
+  <Expandable title="properties">
+    <ParamField path="ReadCapacityUnits" type="number" required>
+      Read capacity units. Must be at least 1.
+    </ParamField>
+    
+    <ParamField path="WriteCapacityUnits" type="number" required>
+      Write capacity units. Must be at least 1.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="BillingMode" type="enum">
+  Billing mode for the table. Must be one of:
+  - `PROVISIONED` - Provisioned capacity mode
+  - `PAY_PER_REQUEST` - On-demand capacity mode
+</ParamField>
+
+## Response
+
+<ResponseField name="TableDescription" type="object">
+  Details about the created table.
+  
+  <Expandable title="properties">
+    <ResponseField name="TableName" type="string">
+      Name of the table.
+    </ResponseField>
+    
+    <ResponseField name="KeySchema" type="array">
+      Key schema elements.
+    </ResponseField>
+    
+    <ResponseField name="AttributeDefinitions" type="array">
+      Attribute definitions.
+    </ResponseField>
+    
+    <ResponseField name="TableStatus" type="string">
+      Current status of the table. Will be `ACTIVE` upon creation.
+    </ResponseField>
+    
+    <ResponseField name="CreationDateTime" type="number">
+      Unix timestamp (in seconds) when the table was created.
+    </ResponseField>
+    
+    <ResponseField name="TableArn" type="string">
+      Amazon Resource Name (ARN) of the table.
+    </ResponseField>
+    
+    <ResponseField name="ItemCount" type="number">
+      Number of items in the table. Will be `0` for new tables.
+    </ResponseField>
+    
+    <ResponseField name="TableSizeBytes" type="number">
+      Size of the table in bytes. Will be `0` for new tables.
+    </ResponseField>
+    
+    <ResponseField name="DeletionProtectionEnabled" type="boolean">
+      Whether deletion protection is enabled.
+    </ResponseField>
+    
+    <ResponseField name="ProvisionedThroughput" type="object">
+      Provisioned throughput settings.
+    </ResponseField>
+    
+    <ResponseField name="BillingModeSummary" type="object">
+      Billing mode details. Present when BillingMode is `PAY_PER_REQUEST`.
+      
+      <Expandable title="properties">
+        <ResponseField name="BillingMode" type="string">
+          Current billing mode.
+        </ResponseField>
+        
+        <ResponseField name="LastUpdateToPayPerRequestDateTime" type="number">
+          Unix timestamp when billing mode was last updated.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.CreateTable" \
+  -d '{
+    "TableName": "Users",
+    "KeySchema": [
+      {
+        "AttributeName": "userId",
+        "KeyType": "HASH"
+      }
+    ],
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "userId",
+        "AttributeType": "S"
+      }
+    ],
+    "BillingMode": "PAY_PER_REQUEST"
+  }'
+```
+
+### Response
+
+```json
+{
+  "TableDescription": {
+    "TableName": "Users",
+    "KeySchema": [
+      {
+        "AttributeName": "userId",
+        "KeyType": "HASH"
+      }
+    ],
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "userId",
+        "AttributeType": "S"
+      }
+    ],
+    "TableStatus": "ACTIVE",
+    "CreationDateTime": 1709481600.123,
+    "ItemCount": 0,
+    "TableSizeBytes": 0,
+    "TableArn": "arn:aws:dynamodb:ddblocal:000000000000:table/Users",
+    "DeletionProtectionEnabled": false,
+    "BillingModeSummary": {
+      "BillingMode": "PAY_PER_REQUEST",
+      "LastUpdateToPayPerRequestDateTime": 1709481600.123
+    }
+  }
+}
+```
+
+## Errors
+
+<ResponseField name="ValidationException" type="error">
+  **Status Code:** 400
+  
+  Returned when:
+  - `TableName` is less than 3 or more than 255 characters
+  - `KeySchema` is empty or contains more than 2 elements
+  - `AttributeDefinitions` is empty
+  - No key schema is defined: "No defined key schema. A key schema containing at least a hash key must be defined for all tables"
+</ResponseField>
+
+<ResponseField name="ResourceInUseException" type="error">
+  **Status Code:** 400
+  
+  Returned when a table with the specified name already exists.
+  
+  **Message:** "Cannot create preexisting table"
+</ResponseField>
+
+<ResponseField name="InternalServerError" type="error">
+  **Status Code:** 500
+  
+  Returned when an unexpected server error occurs.
+</ResponseField>

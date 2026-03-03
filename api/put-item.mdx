@@ -1,0 +1,255 @@
+---
+title: PutItem
+description: Create a new item or replace an existing item with the same primary key
+---
+
+## Overview
+
+The `PutItem` operation creates a new item, or replaces an existing item with the same primary key. If an item with the specified primary key already exists, the entire item is replaced with the new item.
+
+## Request Structure
+
+```json
+{
+  "TableName": "string",
+  "Item": {
+    "AttributeName": AttributeValue,
+    ...
+  },
+  "ConditionExpression": "string",
+  "ExpressionAttributeNames": {
+    "#placeholder": "AttributeName",
+    ...
+  },
+  "ExpressionAttributeValues": {
+    ":value": AttributeValue,
+    ...
+  },
+  "ReturnValues": "NONE" | "ALL_OLD"
+}
+```
+
+## Parameters
+
+<ParamField path="TableName" type="string" required>
+  The name of the table where the item will be stored. Must be between 3 and 255 characters.
+</ParamField>
+
+<ParamField path="Item" type="object" required>
+  A map of attribute name to AttributeValue pairs representing the item. Must include all key attributes defined in the table schema.
+  
+  The item size cannot exceed 400KB. Each attribute value must be one of the supported DynamoDB types (S, N, B, SS, NS, BS, M, L, NULL, BOOL).
+</ParamField>
+
+<ParamField path="ConditionExpression" type="string">
+  A condition that must be satisfied for the PutItem operation to succeed. The operation fails if the condition evaluates to false.
+  
+  Common use cases:
+  - Prevent overwriting existing items: `attribute_not_exists(PK)`
+  - Conditional updates based on attribute values: `#status = :expected`
+</ParamField>
+
+<ParamField path="ExpressionAttributeNames" type="object">
+  A map of placeholder names to actual attribute names. Use this to reference attributes that:
+  - Are reserved words in DynamoDB
+  - Contain special characters
+  - Need to be referenced multiple times in expressions
+  
+  Example: `{"#pk": "userId", "#status": "status"}`
+</ParamField>
+
+<ParamField path="ExpressionAttributeValues" type="object">
+  A map of placeholder values used in condition expressions.
+  
+  Example: `{":active": {"S": "ACTIVE"}, ":min": {"N": "100"}}`
+</ParamField>
+
+<ParamField path="ReturnValues" type="string">
+  Determines what values are returned after the operation.
+  
+  - `NONE` (default): Nothing is returned
+  - `ALL_OLD`: Returns the item as it appeared before the operation (only if item existed)
+</ParamField>
+
+## Response Structure
+
+```json
+{
+  "Attributes": {
+    "AttributeName": AttributeValue,
+    ...
+  }
+}
+```
+
+<ResponseField name="Attributes" type="object">
+  The attribute values as they appeared before the PutItem operation. Only returned if `ReturnValues` is set to `ALL_OLD` and the item existed.
+</ResponseField>
+
+## Examples
+
+### Basic Put
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.PutItem" \
+  -d '{
+    "TableName": "Users",
+    "Item": {
+      "userId": {"S": "user123"},
+      "email": {"S": "user@example.com"},
+      "createdAt": {"N": "1677649200"}
+    }
+  }'
+```
+
+### Conditional Put (Insert Only if Not Exists)
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.PutItem" \
+  -d '{
+    "TableName": "Users",
+    "Item": {
+      "userId": {"S": "user123"},
+      "email": {"S": "user@example.com"},
+      "status": {"S": "ACTIVE"}
+    },
+    "ConditionExpression": "attribute_not_exists(userId)"
+  }'
+```
+
+### Conditional Update with Expression Attributes
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.PutItem" \
+  -d '{
+    "TableName": "Users",
+    "Item": {
+      "userId": {"S": "user123"},
+      "email": {"S": "newemail@example.com"},
+      "status": {"S": "ACTIVE"},
+      "version": {"N": "2"}
+    },
+    "ConditionExpression": "#v = :expectedVersion",
+    "ExpressionAttributeNames": {
+      "#v": "version"
+    },
+    "ExpressionAttributeValues": {
+      "::expectedVersion": {"N": "1"}
+    }
+  }'
+```
+
+### Put with Composite Key (Partition + Sort Key)
+
+```bash
+curl -X POST https://your-worker.workers.dev/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "X-Amz-Target: DynamoDB_20120810.PutItem" \
+  -d '{
+    "TableName": "Orders",
+    "Item": {
+      "customerId": {"S": "customer456"},
+      "orderId": {"S": "order789"},
+      "total": {"N": "99.99"},
+      "items": {"L": [
+        {"M": {"sku": {"S": "PROD1"}, "qty": {"N": "2"}}}
+      ]}
+    }
+  }'
+```
+
+## Error Responses
+
+### ConditionalCheckFailedException
+
+Returned when the condition expression evaluates to false.
+
+```json
+{
+  "__type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed"
+}
+```
+
+**Status Code:** 400
+
+### ValidationException
+
+Returned when the request is malformed or contains invalid values.
+
+```json
+{
+  "__type": "ValidationException",
+  "message": "One of the required keys was not given a value"
+}
+```
+
+**Status Code:** 400
+
+Common causes:
+- Missing required key attributes
+- Empty string values for key attributes
+- Type mismatch for key attributes
+- Item size exceeds 400KB
+- Nesting depth exceeds 32 levels
+- Duplicate values in sets (SS, NS, BS)
+
+### ResourceNotFoundException
+
+Returned when the specified table does not exist.
+
+```json
+{
+  "__type": "ResourceNotFoundException",
+  "message": "Cannot do operations on a non-existent table"
+}
+```
+
+**Status Code:** 400
+
+## Implementation Details
+
+### Partition Routing
+
+The `PutItem` operation uses deterministic hash-based routing:
+
+1. Extract the partition key value from the `Item`
+2. Hash the partition key: `partition_id = hash(PK) % NUM_PARTITIONS`
+3. Route to the corresponding `PartitionDO` Durable Object
+4. The Durable Object executes the write in its dedicated SQLite database
+
+See [partition-do.ts:89-111](https://github.com/shivamd20/shvm-db/blob/main/src/partition-do.ts#L89-L111) for the implementation.
+
+### Write-Through Caching
+
+After a successful write, the item is cached at the edge with a 5-minute TTL to accelerate subsequent reads. The cache is automatically invalidated on updates or deletes.
+
+### Consistency Guarantees
+
+- **Strong consistency** within the same partition key
+- **Read-after-write consistency** for the same partition key
+- No cross-partition transaction support in MVP
+
+## Performance Characteristics
+
+| Metric | Expected Range |
+|--------|----------------|
+| Latency | 3-10ms |
+| Throughput (per partition) | 500-2,000 ops/sec |
+
+Performance is bounded by:
+- SQLite write serialization within the Durable Object
+- Single-threaded execution per partition
+- Network latency to the nearest Cloudflare data center
+
+## Related Operations
+
+- [GetItem](/api/get-item) - Retrieve an item by primary key
+- [UpdateItem](/api/update-item) - Modify specific attributes of an item
+- [DeleteItem](/api/delete-item) - Remove an item from the table

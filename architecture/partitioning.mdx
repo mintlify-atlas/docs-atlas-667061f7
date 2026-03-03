@@ -1,0 +1,314 @@
+---
+title: Partitioning Strategy
+description: Hash-based partition routing and data distribution in shvm-db
+---
+
+## Overview
+
+shvm-db uses **deterministic hash-based partitioning** to distribute data across Durable Objects. This mirrors DynamoDB's approach and ensures consistent routing without central coordination.
+
+## Hash Function
+
+The partition assignment is calculated using a simple but effective hash function:
+
+```typescript
+// From src/index.ts:27-33
+function hashPartitionKey(pk: string, numPartitions: number): number {
+  let hash = 5381;
+  for (let i = 0; i < pk.length; i++) {
+    hash = ((hash << 5) + hash + pk.charCodeAt(i)) >>> 0;
+  }
+  return hash % numPartitions;
+}
+```
+
+### Algorithm Details
+
+- **Base Hash**: djb2 algorithm (widely used, fast, good distribution)
+- **Initial Value**: 5381 (magic constant from djb2)
+- **Operation**: `hash = hash * 33 + charCode`
+- **Unsigned Conversion**: `>>> 0` ensures positive 32-bit integer
+- **Modulo**: Final hash mod number of partitions
+
+### Properties
+
+✅ **Deterministic**: Same PK always maps to same partition
+✅ **Fast**: O(n) where n is key length, no crypto overhead
+✅ **Well-distributed**: djb2 provides good distribution for strings
+✅ **Collision-resistant**: Sufficient for partition count (100-1000s)
+⚠️ **Not cryptographic**: Not suitable for security purposes
+
+## Partition Count Configuration
+
+The number of partitions is configured via environment variable:
+
+```typescript
+// From src/index.ts:21
+NUM_PARTITIONS?: number; // Defaults to 100
+```
+
+**In wrangler.toml:**
+
+```toml
+[vars]
+NUM_PARTITIONS = 100
+```
+
+### Choosing Partition Count
+
+| Workload | Recommended Count | Reasoning |
+|----------|-------------------|-----------|
+| Development | 10-20 | Easy debugging, low overhead |
+| Small production | 50-100 | Good balance for moderate scale |
+| Large production | 500-1000 | Maximum parallelism |
+| Hot-key workload | Lower (50) | Reduces cold partition overhead |
+
+**Important:** Partition count cannot be changed after data is written (MVP limitation).
+
+## Partition Key Construction
+
+Each partition is identified by a unique string:
+
+```typescript
+// From src/index.ts:230
+const partitionId = hashPartitionKey(pkRaw, env.NUM_PARTITIONS ?? 100);
+const pKey = `${tableName}::partition-${partitionId}`;
+```
+
+**Example:**
+
+- Table: `Users`
+- Partition Key: `user123`
+- Hash: 42 (from hash function)
+- Full key: `Users::partition-42`
+
+### Multi-Tenant Isolation
+
+The partition key includes table name, providing:
+
+- **Namespace isolation**: Different tables never share partitions
+- **Independent scaling**: Each table scales separately
+- **Simplified management**: No cross-table conflicts
+
+## Routing Implementation
+
+### Step-by-Step Routing
+
+```typescript
+// 1. Extract partition key from request
+const pkDef = metadata.KeySchema.find(k => k.KeyType === "HASH");
+const pkVal = body.Key?.[pkDef.AttributeName] ?? body.Item?.[pkDef.AttributeName];
+const pkRaw = validateAndGetRawKey(pkVal, pkDef.AttributeName);
+
+// 2. Hash to partition ID
+const partitionId = hashPartitionKey(pkRaw, env.NUM_PARTITIONS ?? 100);
+
+// 3. Construct partition key
+const pKey = `${tableName}::partition-${partitionId}`;
+
+// 4. Get Durable Object stub
+const pStub = env.PARTITION_DO.get(
+  env.PARTITION_DO.idFromName(pKey)
+);
+
+// 5. Invoke operation on DO
+const result = await pStub.handleGetItem(doKey, requestId, Date.now());
+```
+
+### Key Validation
+
+```typescript
+// From src/index.ts:44-50
+function validateAndGetRawKey(v: any, attrName: string): string {
+  if (v === undefined || v === null) 
+    throw new ValidationError("One of the required keys was not given a value");
+  
+  if (v.S === undefined && v.N === undefined && v.B === undefined) 
+    throw new ValidationError("Type mismatch for key");
+  
+  const val = v.S ?? v.N ?? v.B;
+  if (val === "") 
+    throw new ValidationError(`Key attribute cannot be empty: ${attrName}`);
+  
+  return String(val);
+}
+```
+
+## Distribution Characteristics
+
+### Uniform Distribution
+
+With good partition key design:
+
+```
+Partition 0: ████████ 8% of data
+Partition 1: ████████ 8% of data
+Partition 2: ████████ 8% of data
+...
+Partition 99: ████████ 8% of data
+```
+
+### Hot Key Problem
+
+With poor partition key design (e.g., all requests use same PK):
+
+```
+Partition 0: ████████████████████████████ 95% of data
+Partition 1: █ 0.5% of data
+Partition 2: █ 0.5% of data
+...
+```
+
+**Impact:**
+- Partition 0 becomes bottleneck
+- Single-threaded execution limits throughput
+- Other partitions sit idle
+
+## Partition Key Design Guidelines
+
+### ✅ Good Partition Keys
+
+1. **User ID**: `user-{uuid}` - Naturally distributed
+2. **Customer ID**: `customer-{id}` - Even access patterns
+3. **Device ID**: `device-{serial}` - Independent devices
+4. **Session ID**: `session-{uuid}` - Unique per session
+
+### ❌ Bad Partition Keys
+
+1. **Timestamp**: `2024-03-03` - All writes go to today's partition
+2. **Status**: `active` - Limited cardinality, hot keys
+3. **Region**: `us-east` - Uneven geographic distribution
+4. **Boolean**: `true/false` - Only 2 partitions used
+
+### Composite Keys (With Sort Key)
+
+For range queries, combine with sort key:
+
+```
+Partition Key: userId (well-distributed)
+Sort Key: timestamp (sortable, enables queries)
+
+Example:
+  PK: user-abc123
+  SK: 2024-03-03T10:30:00Z
+```
+
+## Static Partitioning (MVP)
+
+The current implementation uses **static partitioning**:
+
+- Partition count set at deployment
+- No automatic partition splitting
+- No partition rebalancing
+- No partition migration
+
+### Implications
+
+**Advantages:**
+- Zero routing overhead
+- Predictable performance
+- Simple implementation
+- No split-brain scenarios
+
+**Limitations:**
+- Can't adapt to hot keys
+- Can't redistribute after growth
+- Must choose partition count upfront
+- Limited by single-partition ceiling
+
+## Performance Characteristics
+
+### Routing Latency
+
+- Hash computation: < 0.01ms (pure CPU)
+- DO stub creation: < 0.1ms (Cloudflare internal)
+- Total routing overhead: **< 1ms**
+
+### Throughput Scaling
+
+```
+Total Throughput = Partitions × Per-Partition Throughput
+
+Example:
+  100 partitions × 1,000 ops/sec = 100,000 ops/sec
+  1,000 partitions × 1,000 ops/sec = 1,000,000 ops/sec
+```
+
+**Assumes:** Well-distributed partition keys
+
+### Hot Partition Impact
+
+Single hot partition limits entire workload:
+
+```
+Hot Partition: 1,000 ops/sec (ceiling)
+Other 99 Partitions: 0 ops/sec (idle)
+→ Total: 1,000 ops/sec
+```
+
+## Partition ID in Response Headers
+
+Every response includes routing information:
+
+```http
+X-SHIVAM-DB-PARTITION-ID-INTERNAL: 42
+X-SHIVAM-DB-PARTITION-KEY: Users::partition-42
+X-SHIVAM-DB-TABLE: Users
+```
+
+Use these headers to:
+- Debug routing issues
+- Identify hot partitions
+- Verify distribution
+- Monitor partition load
+
+## Future: Dynamic Partitioning
+
+Planned enhancements (not in MVP):
+
+### Partition Splitting
+
+```
+Before:
+  Partition 42: [A-Z] → 1000 ops/sec (overloaded)
+
+After:
+  Partition 42-A: [A-M] → 500 ops/sec
+  Partition 42-B: [N-Z] → 500 ops/sec
+```
+
+### Load-Based Routing
+
+- Monitor per-partition QPS
+- Trigger split when threshold exceeded
+- Migrate data to new partitions
+- Update routing table atomically
+
+### Challenges
+
+- Zero-downtime migration
+- Consistent routing during split
+- Tombstone management
+- Cache invalidation
+
+## Comparison with DynamoDB
+
+| Feature | DynamoDB | shvm-db MVP |
+|---------|----------|-------------|
+| Hash function | Proprietary | djb2 + modulo |
+| Partition count | Automatic | Manual configuration |
+| Partition splitting | Automatic | Not supported |
+| Hot key mitigation | Adaptive | Manual key design |
+| Per-partition limit | 1,000 WCU | ~1,000 ops/sec |
+| Cross-partition queries | Supported (Scan) | Not supported |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Durable Objects" icon="cube" href="/architecture/durable-objects">
+    Understand PartitionDO implementation
+  </Card>
+  <Card title="Routing" icon="route" href="/architecture/routing">
+    Deep dive into request routing
+  </Card>
+</CardGroup>

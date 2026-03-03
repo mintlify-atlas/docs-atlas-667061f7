@@ -1,0 +1,236 @@
+---
+title: Why shvm-db
+description: When to use shvm-db and how it compares to alternatives
+---
+
+# When to use shvm-db
+
+shvm-db is **not** a production database. It's a learning tool designed to demystify how DynamoDB works by rebuilding its core architecture with transparent primitives.
+
+## Use shvm-db when you want to
+
+### 1. Understand DynamoDB's architecture
+
+If you've ever wondered:
+
+- Why hot partitions throttle at exactly 1,000 WCU
+- How partition key hashing eliminates coordination overhead
+- Why cross-partition consistency is expensive or impossible
+- What tradeoffs single-writer consistency models make
+
+...then shvm-db gives you a working implementation you can study, modify, and benchmark.
+
+<Info>
+  Every bottleneck in shvm-db mirrors a bottleneck in DynamoDB. Understanding one helps you understand the other.
+</Info>
+
+### 2. Learn distributed systems concepts
+
+shvm-db is a hands-on laboratory for:
+
+- **Partition-based routing** and deterministic hashing
+- **Single-writer consistency** guarantees
+- **Per-partition isolation** and its performance implications
+- **Edge caching** strategies for distributed data
+
+<Note>
+  The codebase prioritizes clarity over cleverness. You can read and understand every line.
+</Note>
+
+### 3. Experiment with database internals
+
+Because shvm-db is transparent and hackable, you can:
+
+- Add observability hooks to measure partition utilization
+- Implement new DynamoDB APIs (Query, Scan, BatchWrite)
+- Experiment with partition splitting strategies
+- Build Global Secondary Indexes with eventual consistency
+- Test different consistency models
+
+The project explicitly calls out [open problems](https://github.com/shivamd20/shvm-db) that make great learning projects.
+
+### 4. Prototype DynamoDB-compatible APIs
+
+If you're building a tool that needs DynamoDB compatibility:
+
+- **Local development** without AWS credentials
+- **Integration tests** that run in CI without mocking
+- **Quick prototypes** that deploy to Cloudflare in seconds
+
+<Warning>
+  Do not use shvm-db for production workloads. It lacks encryption at rest, IAM-grade access control, multi-region replication, and many other production requirements.
+</Warning>
+
+## Don't use shvm-db when
+
+### 1. You need production-grade reliability
+
+shvm-db is missing:
+
+- Encryption at rest
+- Fine-grained access control (IAM)
+- Multi-region active-active writes
+- Automatic partition splitting
+- Point-in-time recovery
+- Compliance certifications (SOC2, HIPAA, etc.)
+
+For production workloads, use the real DynamoDB.
+
+### 2. You need advanced DynamoDB features
+
+The MVP explicitly excludes:
+
+- Global Secondary Indexes (GSI) and Local Secondary Indexes (LSI)
+- Multi-item transactions (`TransactWriteItems`, `TransactGetItems`)
+- Streams and change data capture
+- Time-to-live (TTL)
+- Continuous backups
+
+These are possible future additions, but they're not implemented today.
+
+### 3. You need predictable costs at scale
+
+shvm-db's cost model is simple but can be expensive for certain workloads:
+
+- **Hot partitions** pay for continuous Durable Object CPU time
+- **Write-heavy workloads** pay for SQLite transaction overhead
+- **Cross-partition queries** wake multiple Durable Objects
+
+DynamoDB's provisioned capacity model may be cheaper at high throughput.
+
+### 4. You need multi-region durability guarantees
+
+shvm-db relies on Cloudflare's Durable Object storage guarantees, which are strong but regional. There's no cross-region replication in the MVP.
+
+For globally distributed, mission-critical data, use DynamoDB Global Tables or a multi-region database.
+
+## How shvm-db compares to alternatives
+
+### vs. DynamoDB
+
+| Feature | shvm-db | DynamoDB |
+|---------|---------|----------|
+| **API Compatibility** | Core operations (PutItem, GetItem, UpdateItem, DeleteItem) | Full DynamoDB API |
+| **Consistency** | Strong per-partition | Strong per-partition, eventual globally |
+| **Throughput** | 500-2k writes/sec per partition | 1,000 WCU per partition (configurable) |
+| **Latency** | 3-10ms writes, 2-8ms reads | Single-digit milliseconds |
+| **Cost Model** | Pay per DO execution + storage | Pay per capacity + storage |
+| **Observability** | Transparent bottlenecks | Black box performance |
+| **Production Ready** | No (educational) | Yes |
+
+<Info>
+  Use DynamoDB for production. Use shvm-db to understand how DynamoDB works.
+</Info>
+
+### vs. Redis
+
+| Feature | shvm-db | Redis |
+|---------|---------|-------|
+| **Data Model** | Key-value with partition + sort keys | Key-value, lists, sets, streams |
+| **Consistency** | Strong per-partition, serialized writes | Configurable (eventual or strong) |
+| **Persistence** | SQLite with WAL mode | RDB snapshots or AOF |
+| **Throughput** | Limited by DO single-threaded execution | Very high (multi-threaded) |
+| **API** | DynamoDB-compatible | Redis protocol |
+| **Use Case** | Learning DynamoDB architecture | Cache, session store, real-time apps |
+
+<Note>
+  Redis is far faster for single-partition workloads because it's multi-threaded. shvm-db intentionally uses single-threaded DOs to mirror DynamoDB's partition isolation.
+</Note>
+
+### vs. PostgreSQL (sharded)
+
+| Feature | shvm-db | PostgreSQL (sharded) |
+|---------|---------|----------------------|
+| **Data Model** | DynamoDB key-value | Relational tables with SQL |
+| **Consistency** | Strong per-partition | Strong per shard, distributed transactions possible |
+| **Scaling** | Automatic, deterministic routing | Manual sharding logic required |
+| **Operational Complexity** | Minimal (serverless) | High (manage shards, rebalancing) |
+| **Query Flexibility** | Limited (no joins) | Full SQL |
+| **Use Case** | Learning partition-based systems | Complex queries, relational data |
+
+<Warning>
+  PostgreSQL sharding requires you to implement the routing, rebalancing, and cross-shard coordination that shvm-db handles automatically.
+</Warning>
+
+### vs. DynamoDB Local / LocalStack
+
+| Feature | shvm-db | DynamoDB Local |
+|---------|---------|----------------|
+| **Purpose** | Learn DynamoDB architecture | Test DynamoDB code locally |
+| **Implementation** | Real distributed primitives (Durable Objects) | Single-process mock |
+| **Observability** | Transparent bottlenecks | Hides implementation |
+| **Deployable** | Yes (Cloudflare Workers) | No (local only) |
+| **API Coverage** | Core operations only | Nearly complete DynamoDB API |
+
+<Info>
+  Use DynamoDB Local for testing. Use shvm-db for learning how partition-based systems work.
+</Info>
+
+## Real-world use cases
+
+### 1. Educational projects
+
+Teaching distributed systems?
+
+- Students can deploy their own shvm-db instance
+- Measure partition utilization and throughput ceilings
+- Experiment with partition key design
+- Implement missing features as coursework (GSI, Query, Scan)
+
+### 2. DynamoDB migration planning
+
+Before migrating to DynamoDB:
+
+- Prototype your data model in shvm-db
+- Measure how partition key design affects throughput
+- Understand where hot partitions will appear
+- Learn DynamoDB's consistency model without AWS costs
+
+### 3. Open-source contribution
+
+The project has explicit [open problems](https://github.com/shivamd20/shvm-db):
+
+- **Partition splitting** - detect when a SubDO exceeds thresholds and split it
+- **Global Secondary Indexes** - project attributes into different partition key spaces
+- **Cross-partition transactions** - implement 2PC across PartitionDOs
+
+These are great learning projects if you want to understand distributed systems deeply.
+
+### 4. Rapid prototyping
+
+Building a side project?
+
+- Deploy to Cloudflare Workers in seconds
+- Get DynamoDB-compatible APIs without AWS setup
+- Pay-per-use pricing for hobby-scale workloads
+- Upgrade to real DynamoDB when you need production features
+
+<Warning>
+  Remember: shvm-db is experimental. Back up your data and expect breaking changes.
+</Warning>
+
+## The philosophy
+
+shvm-db is not about building a better DynamoDB. It's about understanding *why* DynamoDB works the way it does.
+
+- **Transparency over performance** - you can see every bottleneck
+- **Clarity over completeness** - implement core features first
+- **Learning over production** - build intuition, not infrastructure
+
+## Ready to learn?
+
+Once you finish exploring shvm-db:
+
+- DynamoDB stops feeling magical
+- Distributed databases stop being abstract
+- You gain intuition that books don't give
+
+<CardGroup cols={2}>
+  <Card title="Get started" icon="rocket" href="/quickstart">
+    Deploy shvm-db to Cloudflare Workers
+  </Card>
+  
+  <Card title="Architecture deep dive" icon="diagram-project" href="/architecture/overview">
+    Understand routing, partitioning, and consistency
+  </Card>
+</CardGroup>

@@ -1,80 +1,198 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get up and running with shvm-db in minutes
 ---
 
-## Get started in three steps
+Get shvm-db running locally in under 5 minutes. This guide walks you through installation, local development, and your first DynamoDB-compatible operations.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Node.js 18 or later
+- npm 10.9.2 or later (specified in package.json)
+- A Cloudflare account (for deployment)
+- Git (to clone the repository)
 
-### Step 2: Deploy your changes
+## Installation
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/shivamd20/shvm-db.git
+    cd shvm-db
+    ```
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Install dependencies">
+    ```bash
+    npm install
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    This installs all required dependencies including:
+    - `wrangler` - Cloudflare Workers CLI
+    - `@cloudflare/workers-types` - TypeScript definitions
+    - `vitest` - Testing framework
+    - `zod` - Schema validation
+  </Step>
 
-### Step 3: Go live
+  <Step title="Start the development server">
+    ```bash
+    npm run dev
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    Or alternatively:
+    ```bash
+    npm start
+    ```
 
-## Next steps
+    Both commands run `wrangler dev`, which starts a local development server with:
+    - Hot reload on file changes
+    - Local Durable Objects emulation
+    - SQLite database per partition
+  </Step>
+</Steps>
 
-Now that you have your docs running, explore these key features:
+Your shvm-db instance is now running at `http://localhost:8787`!
+
+## Your First Request
+
+Let's create a table and put an item using the DynamoDB-compatible API.
+
+### Create a Table
+
+```bash
+curl -X POST http://localhost:8787/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.CreateTable" \
+  -d '{
+    "TableName": "Users",
+    "KeySchema": [
+      { "AttributeName": "userId", "KeyType": "HASH" }
+    ],
+    "AttributeDefinitions": [
+      { "AttributeName": "userId", "AttributeType": "S" }
+    ]
+  }'
+```
+
+### Put an Item
+
+```bash
+curl -X POST http://localhost:8787/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.PutItem" \
+  -d '{
+    "TableName": "Users",
+    "Item": {
+      "userId": { "S": "user123" },
+      "name": { "S": "Alice" },
+      "email": { "S": "alice@example.com" }
+    }
+  }'
+```
+
+### Get an Item
+
+```bash
+curl -X POST http://localhost:8787/api \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.GetItem" \
+  -d '{
+    "TableName": "Users",
+    "Key": {
+      "userId": { "S": "user123" }
+    }
+  }'
+```
+
+Response:
+```json
+{
+  "Item": {
+    "userId": { "S": "user123" },
+    "name": { "S": "Alice" },
+    "email": { "S": "alice@example.com" }
+  }
+}
+```
+
+## Understanding the Architecture
+
+shvm-db uses a **deterministic routing architecture**:
+
+1. **TableRegistryDO**: Global registry storing metadata for all tables
+2. **PartitionDO**: Maps to `TableName + PartitionKey` hash, owns one SQLite database
+3. **Edge Cache**: Cloudflare Cache API for fast reads (5-minute TTL for items)
+
+```text
+Partition Key → SHA-256 Hash → PartitionDO (Storage Executor)
+```
+
+Each PartitionDO:
+- Runs a single SQLite database in WAL mode
+- Guarantees strong per-partition consistency
+- Provides single-writer semantics per partition key
+
+## What's Supported
+
+shvm-db implements core DynamoDB operations:
+
+| Operation | Status | Notes |
+|-----------|--------|-------|
+| `CreateTable` | ✅ Yes | Instantly active |
+| `DeleteTable` | ✅ Yes | Removes metadata |
+| `ListTables` | ✅ Yes | Supports pagination |
+| `DescribeTable` | ✅ Yes | Returns schema metadata |
+| `PutItem` | ✅ Yes | Full condition expressions |
+| `GetItem` | ✅ Yes | Consistent reads |
+| `UpdateItem` | ✅ Yes | Partial support for UpdateExpression |
+| `DeleteItem` | ✅ Yes | Full condition expressions |
+| `Query` | ❌ No | Planned |
+| `Scan` | ❌ No | Excluded from MVP |
+
+## Running Tests
+
+<CodeGroup>
+```bash Local Tests
+npm run test:local
+```
+
+```bash Live Tests
+npm run test:live
+```
+
+```bash Compatibility Tests
+npm test
+```
+</CodeGroup>
+
+## Next Steps
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation" icon="download" href="/installation">
+    Complete installation guide
+  </Card>
+  <Card title="Deployment" icon="cloud" href="/deployment">
+    Deploy to Cloudflare Workers
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/create-table">
+    Explore all DynamoDB operations
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Deep dive into partitioning and routing
+  </Card>
+  <Card title="Deployment" icon="cloud" href="/deployment">
+    Deploy to Cloudflare Workers
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/create-table">
+    Explore all DynamoDB operations
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Deep dive into the system design
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+<Warning>
+  shvm-db is an **experimental educational project**. Do not use it for production workloads or mission-critical data.
+</Warning>

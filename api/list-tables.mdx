@@ -1,0 +1,124 @@
+---
+title: ListTables
+description: List all DynamoDB tables in your shvm-db instance
+---
+
+Returns a list of table names in lexicographical order. Supports pagination for large numbers of tables.
+
+## Request
+
+### Endpoint
+
+```bash
+POST /
+```
+
+### Headers
+
+```bash
+Content-Type: application/x-amz-json-1.0
+x-amz-target: DynamoDB_20120810.ListTables
+```
+
+### Request Body
+
+<ParamField path="Limit" type="number">
+  Maximum number of table names to return. Default is `100`.
+</ParamField>
+
+<ParamField path="ExclusiveStartTableName" type="string">
+  Name of the table to start listing from. Use this for pagination with the `LastEvaluatedTableName` from a previous response.
+</ParamField>
+
+## Response
+
+<ResponseField name="TableNames" type="array">
+  Array of table names in lexicographical order.
+</ResponseField>
+
+<ResponseField name="LastEvaluatedTableName" type="string">
+  Name of the last table in this result set. Present only if there are more tables to retrieve. Use this value as `ExclusiveStartTableName` in the next request to continue pagination.
+</ResponseField>
+
+## Example
+
+### List All Tables
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.ListTables" \
+  -d '{}'
+```
+
+### Response
+
+```json
+{
+  "TableNames": [
+    "Orders",
+    "Products",
+    "Users"
+  ]
+}
+```
+
+### List Tables with Pagination
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.ListTables" \
+  -d '{
+    "Limit": 2
+  }'
+```
+
+### Response with Pagination
+
+```json
+{
+  "TableNames": [
+    "Orders",
+    "Products"
+  ],
+  "LastEvaluatedTableName": "Products"
+}
+```
+
+### Continue Pagination
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.ListTables" \
+  -d '{
+    "Limit": 2,
+    "ExclusiveStartTableName": "Products"
+  }'
+```
+
+### Response (Continuation)
+
+```json
+{
+  "TableNames": [
+    "Users"
+  ]
+}
+```
+
+## Errors
+
+<ResponseField name="InternalServerError" type="error">
+  **Status Code:** 500
+  
+  Returned when an unexpected server error occurs.
+</ResponseField>
+
+## Notes
+
+- Table names are returned in lexicographical (alphabetical) order
+- The default limit is 100 tables per request
+- Use pagination for instances with many tables to avoid timeouts
+- The `LastEvaluatedTableName` field is omitted when all tables have been returned

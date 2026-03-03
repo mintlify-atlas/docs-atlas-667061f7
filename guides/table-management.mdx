@@ -1,0 +1,299 @@
+---
+title: Table Management
+description: Learn how to create, describe, list, and delete tables in shvm-db
+---
+
+shvm-db provides DynamoDB-compatible table management APIs through the `TableRegistryDO`, a global Durable Object that maintains metadata for all tables in your account.
+
+## Creating Tables
+
+Use the `CreateTable` operation to define a new table with its key schema and attribute definitions.
+
+### Basic Table Creation
+
+```typescript
+import { DynamoDBClient, CreateTableCommand } from "@aws-sdk/client-dynamodb";
+
+const client = new DynamoDBClient({
+  endpoint: "https://your-worker.workers.dev/api/",
+  region: "auto",
+});
+
+const command = new CreateTableCommand({
+  TableName: "users",
+  KeySchema: [
+    { AttributeName: "pk", KeyType: "HASH" }
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "pk", AttributeType: "S" }
+  ],
+  BillingMode: "PAY_PER_REQUEST"
+});
+
+const response = await client.send(command);
+```
+
+### Table with Sort Key
+
+For tables requiring range queries, define both a partition key (HASH) and sort key (RANGE):
+
+```typescript
+const command = new CreateTableCommand({
+  TableName: "orders",
+  KeySchema: [
+    { AttributeName: "userId", KeyType: "HASH" },
+    { AttributeName: "orderId", KeyType: "RANGE" }
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "userId", AttributeType: "S" },
+    { AttributeName: "orderId", AttributeType: "S" }
+  ],
+  BillingMode: "PAY_PER_REQUEST"
+});
+```
+
+### Implementation Details
+
+The `TableRegistryDO` validates and stores table metadata:
+
+```typescript
+// From src/table-registry-do.ts:6-44
+async createTable(input: CreateTableInput): Promise<TableDescription> {
+  if (!input.KeySchema || input.KeySchema.length === 0) {
+    throw new ValidationError(
+      "No defined key schema. A key schema containing at least a hash key must be defined for all tables"
+    );
+  }
+
+  const existing = await this.ctx.storage.get<TableMetadata>(input.TableName);
+  if (existing) {
+    throw new Error(`Table ${input.TableName} already exists`);
+  }
+
+  const metadata: any = {
+    TableName: input.TableName,
+    KeySchema: input.KeySchema || [],
+    AttributeDefinitions: input.AttributeDefinitions || [],
+    TableStatus: "ACTIVE", // Simulating instant creation
+    CreationDateTime: Date.now() / 1000,
+    ItemCount: 0,
+    TableSizeBytes: 0,
+    TableArn: `arn:aws:dynamodb:ddblocal:000000000000:table/${input.TableName}`,
+    DeletionProtectionEnabled: false,
+    ProvisionedThroughput: input.ProvisionedThroughput || {
+      LastDecreaseDateTime: 0,
+      LastIncreaseDateTime: 0,
+      NumberOfDecreasesToday: 0,
+      ReadCapacityUnits: 0,
+      WriteCapacityUnits: 0
+    }
+  };
+
+  await this.ctx.storage.put(input.TableName, metadata);
+  return { TableDescription: metadata };
+}
+```
+
+Tables are created instantly with `ACTIVE` status—no waiting required.
+
+## Describing Tables
+
+Retrieve table metadata including schema, creation time, and status:
+
+```typescript
+import { DescribeTableCommand } from "@aws-sdk/client-dynamodb";
+
+const command = new DescribeTableCommand({
+  TableName: "users"
+});
+
+const response = await client.send(command);
+console.log(response.Table);
+```
+
+### Caching Behavior
+
+Table metadata is cached at the edge for 2 hours (7200 seconds) to minimize Durable Object invocations:
+
+```typescript
+// From src/index.ts:183-196
+if (op === "DescribeTable") {
+  const cachedSchema = await cacheManager.getItem<TableMetadata>("table", body.TableName);
+  if (cachedSchema) {
+    addEvent("cache_read", metaStart, Date.now() - requestStartTs - metaStart, 
+      { hit: true, type: "table" });
+    return new Response(JSON.stringify({ Table: cachedSchema }), { headers: baseHeaders });
+  }
+
+  const { metadata } = await metadataService.getTableMetadata(body.TableName);
+
+  // Cache for 2 hours (7200 seconds)
+  await cacheManager.putItem(ctx, "table", body.TableName, metadata, 7200);
+
+  return new Response(JSON.stringify({ Table: metadata }), { headers: baseHeaders });
+}
+```
+
+## Listing Tables
+
+List all tables in your account with pagination support:
+
+```typescript
+import { ListTablesCommand } from "@aws-sdk/client-dynamodb";
+
+const command = new ListTablesCommand({
+  Limit: 100
+});
+
+const response = await client.send(command);
+console.log(response.TableNames);
+```
+
+### Pagination
+
+For large table counts, use `ExclusiveStartTableName` to paginate:
+
+```typescript
+let lastEvaluatedTableName: string | undefined;
+const allTables: string[] = [];
+
+do {
+  const command = new ListTablesCommand({
+    Limit: 10,
+    ExclusiveStartTableName: lastEvaluatedTableName
+  });
+  
+  const response = await client.send(command);
+  allTables.push(...(response.TableNames || []));
+  lastEvaluatedTableName = response.LastEvaluatedTableName;
+} while (lastEvaluatedTableName);
+```
+
+### Implementation
+
+The `listTables` method returns lexicographically sorted table names:
+
+```typescript
+// From src/table-registry-do.ts:69-93
+async listTables(limit?: number, startKey?: string): Promise<{ 
+  TableNames: string[]; 
+  LastEvaluatedTableName?: string 
+}> {
+  // DynamoDB list tables is ordered lexicographically
+  const tables = await this.ctx.storage.list<TableMetadata>();
+  let tableNames = Array.from(tables.keys()).sort();
+
+  if (startKey) {
+    const startIdx = tableNames.indexOf(startKey);
+    if (startIdx >= 0) {
+      tableNames = tableNames.slice(startIdx + 1);
+    }
+  }
+
+  const applyLimit = limit || 100;
+  const resultNames = tableNames.slice(0, applyLimit);
+
+  const result: { TableNames: string[]; LastEvaluatedTableName?: string } = {
+    TableNames: resultNames
+  };
+
+  if (tableNames.length > applyLimit) {
+    result.LastEvaluatedTableName = resultNames[resultNames.length - 1];
+  }
+
+  return result;
+}
+```
+
+## Deleting Tables
+
+Remove a table and its metadata from the registry:
+
+```typescript
+import { DeleteTableCommand } from "@aws-sdk/client-dynamodb";
+
+const command = new DeleteTableCommand({
+  TableName: "users"
+});
+
+const response = await client.send(command);
+```
+
+<Warning>
+Deleting a table only removes its metadata from the `TableRegistryDO`. Underlying partition Durable Objects and their data are orphaned but remain in storage.
+</Warning>
+
+### Implementation
+
+```typescript
+// From src/table-registry-do.ts:47-62
+async deleteTable(tableName: string): Promise<TableDescription | null> {
+  const metadata = await this.ctx.storage.get<TableMetadata>(tableName);
+  if (!metadata) {
+    return null; // Or throw ResourceNotFoundException
+  }
+
+  const originalMetadata = { ...metadata };
+  // Mark as DELETING (optional state transition)
+  metadata.TableStatus = "DELETING";
+  await this.ctx.storage.put(tableName, metadata);
+
+  // Actually delete from storage
+  await this.ctx.storage.delete(tableName);
+
+  return { TableDescription: originalMetadata };
+}
+```
+
+## Validation
+
+### Key Schema Validation
+
+Tables must have at least one key attribute (partition key):
+
+```typescript
+if (!input.KeySchema || input.KeySchema.length === 0) {
+  throw new ValidationError(
+    "No defined key schema. A key schema containing at least a hash key must be defined for all tables"
+  );
+}
+```
+
+### Duplicate Table Names
+
+Attempting to create a table that already exists throws an error:
+
+```typescript
+const existing = await this.ctx.storage.get<TableMetadata>(input.TableName);
+if (existing) {
+  throw new Error(`Table ${input.TableName} already exists`);
+}
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Plan your key schema carefully">
+    Partition keys determine data distribution across Durable Objects. Choose keys that evenly distribute your workload to avoid hot partitions.
+  </Step>
+  
+  <Step title="Use descriptive table names">
+    Table names are globally unique within your account. Use prefixes or namespaces to organize tables by environment or application.
+  </Step>
+  
+  <Step title="Leverage caching">
+    Table metadata is cached for 2 hours. Frequent `DescribeTable` calls won't impact performance or cost.
+  </Step>
+  
+  <Step title="Monitor table count">
+    While there's no hard limit, managing hundreds of tables may require pagination when listing.
+  </Step>
+</Steps>
+
+## Related Operations
+
+Once your table is created, proceed to:
+
+- [Working with Items](/guides/working-with-items) - CRUD operations
+- [Caching Strategy](/guides/caching-strategy) - Edge caching performance
+- [Compatibility Testing](/guides/compatibility-testing) - Testing against DynamoDB

@@ -1,0 +1,421 @@
+---
+title: Fault Tolerance
+description: Failure modes, recovery scenarios, and durability guarantees
+---
+
+## Overview
+
+shvm-db's fault tolerance is **deliberately simple** in the MVP:
+
+- SQLite is the only source of truth
+- No external WAL replay
+- No background replication
+- Durability relies 100% on Cloudflare Durable Object storage guarantees
+
+This section documents **exactly what happens** when things fail.
+
+## Durability Guarantees
+
+### What is Guaranteed
+
+1. **Acknowledged writes are durable**
+   - Once `PutItem` returns success, the write is committed to SQLite WAL
+   - Cloudflare persists Durable Object storage to disk
+   - Data survives process crashes and restarts
+
+2. **Atomic per-partition transactions**
+   - All operations within a single partition are serialized
+   - No torn writes or partial updates
+
+3. **Read-after-write consistency (per partition)**
+   - A successful write is immediately visible to subsequent reads on the same partition key
+
+### What is NOT Guaranteed
+
+1. **Cross-partition consistency**
+   - Writes to different partition keys may not be ordered
+   - No multi-partition transactions in MVP
+
+2. **Point-in-time recovery (PITR)**
+   - Cannot restore to a specific timestamp
+   - No automated backups
+
+3. **Disaster recovery beyond Cloudflare**
+   - If Cloudflare's storage fails catastrophically, data is lost
+   - No external backup to R2 or S3 in MVP
+
+## Failure Scenarios
+
+### 1. Durable Object Process Crash
+
+**Cause:**
+- Unhandled exception in DO code
+- Isolate memory limit exceeded
+- Cloudflare infrastructure restart
+
+**What happens:**
+
+1. In-flight request returns error to client
+2. DO process is restarted by Cloudflare (usually within 1–5 seconds)
+3. New process opens existing SQLite file from persistent storage
+4. SQLite automatically recovers from WAL if needed
+5. Subsequent requests succeed
+
+**Impact:**
+- Single request failure (client sees error)
+- 1–5 second unavailability for that partition key
+- No data loss (SQLite persisted before crash)
+
+**Example trace:**
+
+```
+T=0ms   : Client sends PutItem
+T=5ms   : Worker routes to PartitionDO
+T=10ms  : DO crashes mid-execution
+T=10ms  : Client receives 500 Internal Server Error
+T=2000ms: Client retries PutItem
+T=2005ms: New DO process starts, opens SQLite
+T=2010ms: SQLite WAL recovery completes
+T=2015ms: PutItem succeeds
+```
+
+**Client behavior:**
+- Should retry with exponential backoff
+- Idempotent operations (PutItem with same data) are safe to retry
+
+### 2. SQLite Write Failure
+
+**Cause:**
+- Disk space exhaustion (rare on Cloudflare)
+- SQLite corruption (extremely rare)
+- Lock timeout (should not happen in single-writer model)
+
+**What happens:**
+
+1. DO catches SQLite exception
+2. Returns error to client (e.g., `InternalServerError` or `ServiceUnavailable`)
+3. DO remains running (not a crash)
+4. Subsequent writes may succeed (if transient issue) or fail consistently (if corruption)
+
+**Impact:**
+- Request fails, client sees error
+- If corruption: partition is **permanently unavailable** until manual intervention
+
+**Manual recovery:**
+
+```typescript
+// Requires code change to expose recovery endpoint
+const partitionDO = env.PARTITION_DO.get(id);
+await partitionDO.repairSQLite(); // Hypothetical recovery method
+```
+
+**In MVP:** No automated recovery. Contact Cloudflare support if persistent.
+
+### 3. Cache Invalidation Failure
+
+**Cause:**
+- Cloudflare Cache API unavailable (rare)
+- Network partition between worker and cache
+
+**What happens:**
+
+1. Write succeeds to SQLite (authoritative)
+2. Cache invalidation (`cache.delete()`) fails silently
+3. Stale data remains cached for up to 5 minutes
+
+**Impact:**
+- **Read inconsistency:** Clients may see old data until cache TTL expires
+- **Duration:** Maximum 5 minutes (cache TTL)
+- **Severity:** Medium (eventual consistency violation)
+
+**Mitigation:**
+- Cache uses `GetItem` responses with 5-minute TTL
+- Writes **never** rely on cache (always go to DO)
+- Worst case: 5-minute stale read
+
+### 4. Network Partition (Client ↔ Worker)
+
+**Cause:**
+- Client network failure
+- DNS resolution failure
+- TLS handshake timeout
+
+**What happens:**
+
+1. Client request never reaches worker
+2. Client sees timeout or connection error
+3. No data loss (request never processed)
+
+**Impact:**
+- Request failure from client perspective
+- Server unaware of attempt (no partial state)
+
+**Client behavior:**
+- Retry with exponential backoff
+- Check request status if possible (idempotency tokens not supported in MVP)
+
+### 5. Network Partition (Worker ↔ Durable Object)
+
+**Cause:**
+- Cloudflare internal network issue (extremely rare)
+
+**What happens:**
+
+1. Worker sends RPC to DO
+2. Request times out (default: 30 seconds)
+3. Worker returns error to client
+4. DO may or may not have processed the request
+
+**Impact:**
+- **Unknown state:** Client cannot determine if write succeeded
+- **Risk:** Retry may cause duplicate write (if original succeeded but response lost)
+
+**Mitigation in MVP:**
+- Use idempotent operations where possible
+- `PutItem` with identical payload is safe to retry
+
+**Future improvement:** Idempotency tokens (see Roadmap).
+
+### 6. Cold Start Delays
+
+**Cause:**
+- First request to a partition after inactivity
+- Durable Object not yet instantiated
+
+**What happens:**
+
+1. Worker requests DO stub
+2. Cloudflare starts new DO process
+3. DO constructor runs: `runMigrations()` + open SQLite
+4. Request proceeds normally
+
+**Impact:**
+- **Latency spike:** +50–200ms for first request
+- **No data loss:** SQLite opens existing file
+
+**Frequency:**
+- Rare in production (DOs stay alive under steady traffic)
+- Common in testing (long idle periods)
+
+**Monitoring:**
+- Check trace data: `partition_do_invoke` >> 10ms indicates cold start
+
+## Recovery Procedures
+
+### Automatic Recovery (Built-In)
+
+1. **DO Crash → Restart**
+   - Cloudflare automatically restarts crashed DOs
+   - SQLite WAL recovery runs on next open
+   - No manual intervention required
+
+2. **Cache Staleness → TTL Expiry**
+   - Stale cache entries expire after 5 minutes
+   - No manual cache flush needed
+
+### Manual Recovery (Rare)
+
+#### Scenario: Persistent SQLite Corruption
+
+**Symptoms:**
+- All writes to a partition fail with `InternalServerError`
+- Trace shows `sqlite_query` exception
+
+**Recovery (requires code change):**
+
+```typescript
+// Add to PartitionDO class
+async nukeSQLite() {
+  await this.ctx.storage.deleteAll(); // DANGEROUS: deletes all data
+  this.sql = this.ctx.storage.sql;
+  runMigrations(this.sql);
+  return { status: "reset" };
+}
+```
+
+Expose via admin endpoint:
+
+```typescript
+if (url.pathname === "/admin/reset-partition") {
+  const partitionId = url.searchParams.get("id");
+  const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromString(partitionId));
+  await stub.nukeSQLite();
+  return new Response("Partition reset");
+}
+```
+
+**WARNING:** This **deletes all data** for that partition. Only use as last resort.
+
+#### Scenario: Stuck Alarm (TraceDO)
+
+**Symptoms:**
+- Trace events not flushing
+- Memory growth in TraceDO
+
+**Recovery:**
+
+```bash
+# Restart TraceDO by deleting its alarm
+curl -X POST https://your-worker.dev/admin/reset-trace
+```
+
+Implement in worker:
+
+```typescript
+if (url.pathname === "/admin/reset-trace") {
+  const traceDO = env.TRACE_DO.get(env.TRACE_DO.idFromName("shvm-db-trace"));
+  await traceDO.resetAlarm();
+  return new Response("TraceDO alarm reset");
+}
+```
+
+## Data Loss Scenarios
+
+### Possible Data Loss Events
+
+| Scenario | Data Loss Risk | Likelihood | Mitigation |
+|----------|----------------|------------|------------|
+| DO crash before SQLite commit | **High** | Very Low | SQLite WAL ensures atomicity |
+| Cloudflare storage catastrophic failure | **Total** | Extremely Low | No mitigation in MVP (requires external backup) |
+| Manual partition reset | **Total** (for that partition) | Only if admin error | Confirmation prompts, audit logs |
+| SQLite corruption | **Partial** (unrecoverable rows) | Extremely Low | SQLite integrity checks (future) |
+
+### Zero Data Loss Events (Safe)
+
+| Scenario | Why Safe |
+|----------|----------|
+| DO restart | SQLite persisted to disk |
+| Worker restart | Stateless, no data in worker |
+| Cache failure | Cache is not authoritative |
+| Client retry | Idempotent operations |
+| Network partition | Request never processed or fully completed |
+
+## High Availability
+
+### Current Limitations
+
+1. **Single-region deployment**
+   - Durable Objects are sticky to the region of first creation
+   - No automatic cross-region failover
+
+2. **No read replicas**
+   - All reads go to primary DO
+   - Cannot offload read traffic to secondary regions
+
+3. **No automatic partition migration**
+   - If a Cloudflare datacenter goes offline, partitions hosted there are unavailable
+
+### Expected Availability
+
+**Cloudflare SLA:**
+- Workers: 99.99% uptime
+- Durable Objects: 99.9% uptime (lower than Workers)
+
+**Realistic Expectations:**
+- Per-partition availability: 99.9%
+- System-wide availability: 99.95% (multiple partitions reduce blast radius)
+
+**Downtime causes:**
+- Cloudflare platform maintenance (~1 hour/year)
+- Regional outages (~30 minutes/year)
+- DO-specific issues (~30 minutes/year)
+
+## Disaster Recovery
+
+### Backup Strategy (Manual)
+
+**Not included in MVP.** To implement:
+
+1. **Export data periodically:**
+   ```typescript
+   // Add to PartitionDO
+   async exportToR2() {
+     const cursor = this.sql.exec("SELECT * FROM items_v3");
+     const items = Array.from(cursor);
+     const blob = JSON.stringify(items);
+     await env.R2_BUCKET.put(`backup-${Date.now()}.json`, blob);
+   }
+   ```
+
+2. **Schedule backups:**
+   - Use Cloudflare Cron Triggers
+   - Run hourly or daily for each partition
+
+3. **Restore from backup:**
+   ```typescript
+   async restoreFromR2(key: string) {
+     const obj = await env.R2_BUCKET.get(key);
+     const items = JSON.parse(await obj.text());
+     for (const item of items) {
+       this.sql.exec("INSERT OR REPLACE INTO items_v3 ...", ...);
+     }
+   }
+   ```
+
+**Cost:** R2 storage is cheap (~$0.015/GB-month).
+
+### Multi-Region Deployment (Future)
+
+Requires:
+- Primary-Secondary replication
+- Conflict resolution (last-write-wins)
+- Automatic failover
+
+**Not in MVP.** See [ROADMAP.md](https://github.com/shivamd20/shvm-db/blob/main/ROADMAP.md).
+
+## Monitoring for Failures
+
+### Critical Alerts
+
+1. **Error rate > 5%**
+   - Indicates systemic failure (DO crashes, SQLite corruption)
+   - **Action:** Check Cloudflare logs, inspect DO health
+
+2. **P99 latency > 100ms (sustained)**
+   - Possible DO restart loop or hot partition saturation
+   - **Action:** Fetch traces, identify bottleneck
+
+3. **Zero requests to a partition for >10 minutes (unexpected)**
+   - Partition may be stuck or crashed
+   - **Action:** Send health check request
+
+### Trace-Based Debugging
+
+**Check for failure patterns:**
+
+```bash
+curl "https://your-worker.dev/api/trace?requestId=<failed-request>"
+```
+
+Look for:
+- Missing `sqlite_query` step (DO crashed before execution)
+- `partition_do_invoke` >> 1 second (stuck/timeout)
+- Error in `attributes` field
+
+## FAQ
+
+### Q: What happens if Cloudflare goes down?
+
+A: shvm-db is unavailable. No automatic failover in MVP.
+
+### Q: Can I lose data from a successful write?
+
+A: Extremely unlikely. SQLite + Cloudflare storage guarantees persist acknowledged writes.
+
+### Q: How do I backup my data?
+
+A: Not built-in. Export via Scan (future) or implement custom R2 backup (see above).
+
+### Q: What if a Durable Object is stuck?
+
+A: No automated detection in MVP. Monitor error rates and manually restart if needed (requires admin endpoint).
+
+### Q: Can I run shvm-db in multiple regions?
+
+A: Not in MVP. Durable Objects are region-sticky. Future: active-active replication.
+
+## Next Steps
+
+- Understand performance implications: [Performance Characteristics](/operations/performance)
+- Monitor production health: [Monitoring](/operations/monitoring)
+- Estimate costs: [Cost Model](/operations/cost-model)

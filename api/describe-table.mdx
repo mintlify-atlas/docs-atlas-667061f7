@@ -1,0 +1,211 @@
+---
+title: DescribeTable
+description: Get detailed information about a DynamoDB table
+---
+
+Returns detailed information about the specified table, including its schema, status, creation time, and size metrics.
+
+## Request
+
+### Endpoint
+
+```bash
+POST /
+```
+
+### Headers
+
+```bash
+Content-Type: application/x-amz-json-1.0
+x-amz-target: DynamoDB_20120810.DescribeTable
+```
+
+### Request Body
+
+<ParamField path="TableName" type="string" required>
+  Name of the table to describe.
+</ParamField>
+
+## Response
+
+<ResponseField name="Table" type="object">
+  Complete metadata about the table.
+  
+  <Expandable title="properties">
+    <ResponseField name="TableName" type="string">
+      Name of the table.
+    </ResponseField>
+    
+    <ResponseField name="KeySchema" type="array">
+      Primary key structure of the table.
+      
+      <Expandable title="KeySchemaElement">
+        <ResponseField name="AttributeName" type="string">
+          Name of the key attribute.
+        </ResponseField>
+        
+        <ResponseField name="KeyType" type="string">
+          Type of key: `HASH` (partition key) or `RANGE` (sort key).
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    
+    <ResponseField name="AttributeDefinitions" type="array">
+      Attribute definitions for key attributes.
+      
+      <Expandable title="AttributeDefinition">
+        <ResponseField name="AttributeName" type="string">
+          Name of the attribute.
+        </ResponseField>
+        
+        <ResponseField name="AttributeType" type="string">
+          Data type: `S` (String), `N` (Number), or `B` (Binary).
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    
+    <ResponseField name="TableStatus" type="string">
+      Current status of the table: `CREATING`, `ACTIVE`, or `DELETING`.
+    </ResponseField>
+    
+    <ResponseField name="CreationDateTime" type="number">
+      Unix timestamp (in seconds) when the table was created.
+    </ResponseField>
+    
+    <ResponseField name="ItemCount" type="number">
+      Approximate number of items in the table.
+    </ResponseField>
+    
+    <ResponseField name="TableSizeBytes" type="number">
+      Approximate size of the table in bytes.
+    </ResponseField>
+    
+    <ResponseField name="TableArn" type="string">
+      Amazon Resource Name (ARN) of the table.
+    </ResponseField>
+    
+    <ResponseField name="DeletionProtectionEnabled" type="boolean">
+      Whether deletion protection is enabled for this table.
+    </ResponseField>
+    
+    <ResponseField name="ProvisionedThroughput" type="object">
+      Provisioned throughput settings for the table.
+      
+      <Expandable title="properties">
+        <ResponseField name="ReadCapacityUnits" type="number">
+          Provisioned read capacity units.
+        </ResponseField>
+        
+        <ResponseField name="WriteCapacityUnits" type="number">
+          Provisioned write capacity units.
+        </ResponseField>
+        
+        <ResponseField name="LastIncreaseDateTime" type="number">
+          Timestamp of last capacity increase.
+        </ResponseField>
+        
+        <ResponseField name="LastDecreaseDateTime" type="number">
+          Timestamp of last capacity decrease.
+        </ResponseField>
+        
+        <ResponseField name="NumberOfDecreasesToday" type="number">
+          Number of capacity decreases today.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    
+    <ResponseField name="BillingModeSummary" type="object">
+      Billing mode information. Present when table uses `PAY_PER_REQUEST` billing.
+      
+      <Expandable title="properties">
+        <ResponseField name="BillingMode" type="string">
+          Current billing mode: `PROVISIONED` or `PAY_PER_REQUEST`.
+        </ResponseField>
+        
+        <ResponseField name="LastUpdateToPayPerRequestDateTime" type="number">
+          Unix timestamp when billing mode was last updated to pay-per-request.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example
+
+```bash
+curl -X POST https://your-instance.workers.dev/ \
+  -H "Content-Type: application/x-amz-json-1.0" \
+  -H "x-amz-target: DynamoDB_20120810.DescribeTable" \
+  -d '{
+    "TableName": "Users"
+  }'
+```
+
+### Response
+
+```json
+{
+  "Table": {
+    "TableName": "Users",
+    "KeySchema": [
+      {
+        "AttributeName": "userId",
+        "KeyType": "HASH"
+      },
+      {
+        "AttributeName": "createdAt",
+        "KeyType": "RANGE"
+      }
+    ],
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "userId",
+        "AttributeType": "S"
+      },
+      {
+        "AttributeName": "createdAt",
+        "AttributeType": "N"
+      }
+    ],
+    "TableStatus": "ACTIVE",
+    "CreationDateTime": 1709481600.123,
+    "ItemCount": 1523,
+    "TableSizeBytes": 245760,
+    "TableArn": "arn:aws:dynamodb:ddblocal:000000000000:table/Users",
+    "DeletionProtectionEnabled": false,
+    "ProvisionedThroughput": {
+      "ReadCapacityUnits": 0,
+      "WriteCapacityUnits": 0,
+      "LastIncreaseDateTime": 0,
+      "LastDecreaseDateTime": 0,
+      "NumberOfDecreasesToday": 0
+    },
+    "BillingModeSummary": {
+      "BillingMode": "PAY_PER_REQUEST",
+      "LastUpdateToPayPerRequestDateTime": 1709481600.123
+    }
+  }
+}
+```
+
+## Errors
+
+<ResponseField name="ResourceNotFoundException" type="error">
+  **Status Code:** 400
+  
+  Returned when the specified table does not exist.
+  
+  **Message:** "Cannot do operations on a non-existent table"
+</ResponseField>
+
+<ResponseField name="InternalServerError" type="error">
+  **Status Code:** 500
+  
+  Returned when an unexpected server error occurs.
+</ResponseField>
+
+## Notes
+
+- Table metadata is cached for up to 2 hours (7200 seconds) for improved performance
+- `ItemCount` and `TableSizeBytes` are approximate values
+- The response structure matches AWS DynamoDB's DescribeTable API for compatibility
